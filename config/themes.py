@@ -1320,3 +1320,32 @@ QFormLayout QLabel {
     font-size: 12px;
 }
 """
+
+import re as _re
+
+_DEFAULT_BASE = 13  # The base font size the QSS was authored at (px)
+_FONT_SIZE_RE = _re.compile(r'font-size:\s*(\d+)(px|pt)')
+
+
+def scale_theme(qss: str, base_pt: int) -> str:
+    """Return *qss* with every ``font-size: Npx`` or ``font-size: Npt``
+    scaled to *base_pt*.
+
+    Each hardcoded size is treated as a delta from the default 13 px
+    baseline, so the relative proportions are preserved:
+
+        scaled = original + (base_pt - 13)
+
+    The minimum is clamped to 7 so tiny elements remain legible.
+    """
+    if base_pt == _DEFAULT_BASE:
+        return qss  # No change needed
+    delta = base_pt - _DEFAULT_BASE
+
+    def _replace(m: _re.Match) -> str:
+        orig = int(m.group(1))
+        unit = m.group(2)
+        scaled = max(7, orig + delta)
+        return f'font-size: {scaled}{unit}'
+
+    return _FONT_SIZE_RE.sub(_replace, qss)

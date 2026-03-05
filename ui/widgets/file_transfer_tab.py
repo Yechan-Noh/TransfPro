@@ -608,8 +608,9 @@ class FileTransferTab(QWidget):
             lambda paths, target: self.download_files(paths, target))
         self.local_pane.transfer_button_clicked.connect(self._on_upload_clicked)
         self.remote_pane.transfer_button_clicked.connect(self._on_download_clicked)
-        self.remote_pane.macro_download_requested.connect(self._on_macro_download)
-        self.local_pane.macro_upload_requested.connect(self._on_macro_upload)
+        # Quick Transfer Macros — both panes emit the same signal
+        self.local_pane.transfer_macro_requested.connect(self._on_transfer_macro)
+        self.remote_pane.transfer_macro_requested.connect(self._on_transfer_macro)
         self.remote_pane.open_remote_file_requested.connect(self._on_open_remote_file)
         self.remote_pane.open_remote_with_requested.connect(self._on_open_remote_with)
         # Keep mini-terminal cwd in sync when navigating the file browser
@@ -636,17 +637,12 @@ class FileTransferTab(QWidget):
             return
         self.download_files(selected_paths, self.local_pane.current_path)
 
-    def _on_macro_download(self, remote_paths: list, remote_dir: str):
-        """Handle macro download — download matched files to current local folder."""
-        if not remote_paths:
-            return
-        self.download_files(remote_paths, self.local_pane.current_path)
-
-    def _on_macro_upload(self, local_paths: list, local_dir: str):
-        """Handle macro upload — upload matched files to current remote folder."""
-        if not local_paths:
-            return
-        self.upload_files(local_paths, self.remote_pane.current_path)
+    def _on_transfer_macro(self, local_path: str, remote_path: str, direction: str):
+        """Execute a quick transfer macro."""
+        if direction == 'upload':
+            self.upload_files([local_path], remote_path)
+        else:
+            self.download_files([remote_path], local_path)
 
     # ── Transfer logic ──
 
@@ -1153,33 +1149,35 @@ class FileTransferTab(QWidget):
             self._on_cancel_requested(tid)
 
     def closeEvent(self, event):
-        # Cancel all transfers first (wakes paused workers too)
+        if getattr(self, '_shutdown_done', False):
+            # MainWindow already cleaned everything up — skip waits.
+            super().closeEvent(event)
+            return
+
+        # Standalone close (tab destroyed independently)
         for worker in list(self.transfer_workers.values()):
             try:
                 worker.cancel()
             except RuntimeError:
                 pass
-
-        # Ask all transfer threads to quit
         for thread in list(self.transfer_threads.values()):
             if thread.isRunning():
                 thread.quit()
-
-        # Wait once for all threads (shared 2-second deadline, not per-thread)
-        for tid, thread in list(self.transfer_threads.items()):
-            if thread.isRunning() and not thread.wait(500):
-                thread.terminate()
-
+        import time
+        deadline = time.monotonic() + 0.5
+        for thread in list(self.transfer_threads.values()):
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            if thread.isRunning() and remaining > 0:
+                if not thread.wait(remaining):
+                    thread.terminate()
         self.transfer_threads.clear()
         self.transfer_workers.clear()
 
-        # Clean up file browser threads
         if hasattr(self, 'local_pane'):
             self.local_pane.cleanup_browser_thread()
         if hasattr(self, 'remote_pane'):
             self.remote_pane.cleanup_browser_thread()
 
-        # Clean up mini-terminals
         if hasattr(self, 'local_terminal'):
             self.local_terminal.disconnect_terminal()
         if hasattr(self, 'remote_terminal'):

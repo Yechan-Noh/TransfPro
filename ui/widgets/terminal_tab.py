@@ -8,7 +8,6 @@ and real-time output streaming from remote SSH channels.
 
 import logging
 import socket
-import time
 import re
 from typing import Optional, List
 from collections import deque
@@ -87,7 +86,12 @@ _SEND_BTN_STYLE = """
 
 
 class TerminalReaderThread(QThread):
-    """Background thread that reads data from SSH channel."""
+    """Background thread that reads data from SSH channel.
+
+    Uses a blocking ``recv()`` with a short timeout instead of
+    polling ``recv_ready()`` + ``sleep()``.  The channel timeout
+    is set to 0.05 s so the loop checks ``_running`` ~20 times/s.
+    """
 
     data_received = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
@@ -99,33 +103,30 @@ class TerminalReaderThread(QThread):
         self._running = True
 
     def run(self):
-        """Read from channel in background loop."""
         try:
+            # Short blocking timeout — recv() will return b'' on
+            # timeout, letting us check _running frequently.
+            self.channel.settimeout(0.05)
+
             while self._running and self.channel and not self.channel.closed:
                 try:
-                    if self.channel.recv_ready():
-                        data = self.channel.recv(4096)
-                        if data:
-                            decoded = data.decode('utf-8', errors='replace')
-                            self.data_received.emit(decoded)
-                        else:
-                            break
+                    data = self.channel.recv(4096)
+                    if data:
+                        self.data_received.emit(
+                            data.decode('utf-8', errors='replace'))
                     else:
-                        time.sleep(0.02)
+                        break  # EOF — channel closed by remote
                 except socket.timeout:
-                    continue
+                    continue  # no data yet — loop back and check _running
                 except EOFError:
                     break
                 except OSError:
-                    # Channel/transport was closed — expected during disconnect
-                    break
+                    break  # channel/transport closed during disconnect
                 except Exception:
-                    # Catch-all for paramiko internal errors during shutdown
                     break
 
-            if not self._running:
-                return
-            self.channel_closed.emit()
+            if self._running:
+                self.channel_closed.emit()
 
         except Exception as e:
             if self._running:
@@ -133,13 +134,7 @@ class TerminalReaderThread(QThread):
 
     def stop(self):
         self._running = False
-        # Close channel to unblock any pending recv_ready() / sleep loop
-        if self.channel and not self.channel.closed:
-            try:
-                self.channel.close()
-            except Exception:
-                pass
-        self.wait(timeout=3000)
+        self.wait(200)
 
 
 class TerminalTab(QWidget):
@@ -553,23 +548,8 @@ class TerminalTab(QWidget):
             self.channel.invoke_shell()
             self.channel.settimeout(0.1)
 
-            # Drain any initial data (MOTD / login banner) that arrived
-            # between invoke_shell() and starting the reader thread.
-            time.sleep(0.3)  # brief pause to let the shell send the banner
-            initial_data = b''
-            try:
-                while self.channel.recv_ready():
-                    chunk = self.channel.recv(4096)
-                    if chunk:
-                        initial_data += chunk
-                    else:
-                        break
-            except (socket.timeout, OSError):
-                pass
-            if initial_data:
-                decoded = initial_data.decode('utf-8', errors='replace')
-                self._on_data_received(decoded)
-
+            # Start the reader thread immediately — it will pick up
+            # the MOTD / login banner as soon as it arrives.
             self.reader_thread = TerminalReaderThread(self.channel)
             self.reader_thread.data_received.connect(
                 self._on_data_received, Qt.QueuedConnection)
@@ -596,20 +576,36 @@ class TerminalTab(QWidget):
             self._update_status(f"Error: {str(e)[:30]}", "#ff6b6b")
 
     def disconnect_terminal(self):
-        """Close terminal and cleanup."""
+        """Close terminal and cleanup.
+
+        Closes the channel BEFORE stopping the reader thread so the
+        blocking recv() unblocks immediately.  Disconnects signals first
+        to prevent queued data_received calls from arriving after the
+        widget is being destroyed (avoids QTextBlock/QTextCursor warnings).
+        """
         if not self._connected and self.reader_thread is None and self.channel is None:
             return  # Already disconnected — nothing to do
         self._connected = False
         try:
+            # Disconnect signals first to avoid late-arriving queued calls
             if self.reader_thread:
-                self.reader_thread.stop()
-                self.reader_thread = None
+                try:
+                    self.reader_thread.data_received.disconnect()
+                    self.reader_thread.error_occurred.disconnect()
+                    self.reader_thread.channel_closed.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+            # Close channel to unblock the reader's recv()
             if self.channel:
                 try:
                     self.channel.close()
                 except Exception:
-                    pass  # Channel may already be closed by SSH disconnect
+                    pass
                 self.channel = None
+            # Now stop the reader — returns almost immediately
+            if self.reader_thread:
+                self.reader_thread.stop()
+                self.reader_thread = None
             self._update_status("Disconnected", "#ffaa00")
             logger.info("Terminal disconnected")
         except Exception as e:
@@ -999,6 +995,25 @@ class TerminalTab(QWidget):
             if col > 0:
                 cursor.movePosition(
                     QTextCursor.Right, QTextCursor.MoveAnchor, min(col, line_len))
+        elif final in ('H', 'f'):  # Cursor Position  \x1b[row;colH
+            row = max((params[0] if len(params) > 0 else 1), 1)
+            col = max((params[1] if len(params) > 1 else 1), 1)
+            # Move cursor to absolute (row, col) in the document.
+            # Extend document with blank lines if needed.
+            doc = cursor.document()
+            while doc.blockCount() < row:
+                cursor.movePosition(QTextCursor.End)
+                cursor.insertText('\n')
+            block = doc.findBlockByNumber(row - 1)
+            cursor.setPosition(block.position())
+            # Extend line with spaces if needed
+            line_len = block.length() - 1
+            if col - 1 > line_len:
+                cursor.movePosition(QTextCursor.EndOfBlock)
+                cursor.insertText(' ' * (col - 1 - line_len))
+            else:
+                cursor.movePosition(
+                    QTextCursor.Right, QTextCursor.MoveAnchor, col - 1)
         elif final == 'K':  # Erase in Line
             mode = n or 0
             if mode == 0:
@@ -1016,7 +1031,16 @@ class TerminalTab(QWidget):
                 cursor.removeSelectedText()
         elif final == 'J':  # Erase in Display
             mode = n or 0
-            if mode == 2:
+            if mode == 0:  # Clear from cursor to end of screen
+                cursor.movePosition(
+                    QTextCursor.End, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            elif mode == 1:  # Clear from start to cursor
+                pos = cursor.position()
+                cursor.movePosition(
+                    QTextCursor.Start, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            elif mode == 2:  # Clear entire screen
                 cursor.select(QTextCursor.Document)
                 cursor.removeSelectedText()
         elif final == 'P':  # Delete characters
@@ -1354,6 +1378,10 @@ class TerminalTab(QWidget):
         self._connected = False
         logger.info("Terminal channel closed")
 
+        # Skip auto-reconnect during application shutdown
+        if getattr(self, '_shutdown_done', False):
+            return
+
         # Auto-reconnect if SSH transport is still alive (max 3 rapid retries)
         if not hasattr(self, '_reconnect_count'):
             self._reconnect_count = 0
@@ -1381,6 +1409,8 @@ class TerminalTab(QWidget):
             self.connection_lost.emit()
 
     def _on_connection_status_changed(self, connected: bool):
+        if getattr(self, '_shutdown_done', False):
+            return
         if not connected:
             self.disconnect_terminal()
         else:
@@ -1395,5 +1425,8 @@ class TerminalTab(QWidget):
 
     def closeEvent(self, event):
         """Ensure reader thread is stopped before widget destruction."""
+        if getattr(self, '_shutdown_done', False):
+            super().closeEvent(event)
+            return
         self.disconnect_terminal()
         super().closeEvent(event)

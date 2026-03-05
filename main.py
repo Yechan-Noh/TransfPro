@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, qInstallMessageHandler, QtWarningMsg
 from PyQt5.QtGui import QIcon, QFont
 
 from transfpro.ui.main_window import MainWindow
@@ -59,6 +59,27 @@ def setup_application():
     Returns:
         QApplication: Configured Qt application instance
     """
+    # Suppress harmless Qt warnings that cannot be fixed from Python.
+    # QPlainTextEdit internally uses QTextBlock/QTextCursor in cross-thread
+    # signal arguments; PyQt5 does not expose qRegisterMetaType() so these
+    # warnings are unavoidable but entirely cosmetic.
+    _SUPPRESSED_WARNINGS = (
+        b"Cannot queue arguments of type 'QTextBlock'",
+        b"Cannot queue arguments of type 'QTextCursor'",
+        b"Timers cannot be stopped from another thread",
+    )
+
+    def _qt_message_filter(msg_type, context, message):
+        if msg_type == QtWarningMsg:
+            msg_bytes = message.encode('utf-8') if isinstance(message, str) else message
+            for suppressed in _SUPPRESSED_WARNINGS:
+                if suppressed in msg_bytes:
+                    return  # silently drop
+        # Let everything else through to stderr
+        sys.stderr.write(message + '\n')
+
+    qInstallMessageHandler(_qt_message_filter)
+
     # High-DPI support (must be set before QApplication is created)
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
@@ -133,7 +154,18 @@ def main():
         logger.info(f"Application exiting with code {exit_code}")
         logger.info("=" * 70)
 
-        return exit_code
+        # ── Hard exit to avoid hanging on non-daemon threads ──
+        # closeEvent() has already performed all meaningful cleanup
+        # (socket kill, thread shutdown, SSH disconnect).  Python's
+        # normal shutdown path calls threading._shutdown() which waits
+        # forever for any non-daemon thread still alive — and QThread
+        # subclasses (reader threads, browser workers) create non-daemon
+        # OS threads that QThread.terminate() may fail to kill on macOS.
+        # Paramiko's atexit handler (_join_lingering_threads) can also
+        # block indefinitely.  os._exit() bypasses both, giving us a
+        # clean, instant exit.
+        import os as _os
+        _os._exit(exit_code)
 
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)

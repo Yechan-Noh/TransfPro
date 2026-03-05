@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QGroupBox,
     QFormLayout, QLabel, QPlainTextEdit, QMessageBox, QSplitter,
     QLineEdit, QCheckBox, QDialog, QSizePolicy, QInputDialog,
-    QGridLayout, QScrollArea
+    QGridLayout, QScrollArea, QApplication
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QSize, QEvent, QTimer
 from PyQt5.QtGui import QIcon, QColor, QFont, QPixmap, QPainter
@@ -21,6 +21,7 @@ from transfpro.core.database import Database
 from transfpro.workers.ssh_connect_worker import SSHConnectWorker, SSHDisconnectWorker
 from transfpro.ui.dialogs.connection_dialog import ConnectionDialog
 from transfpro.ui.widgets.status_indicators import StatusLight
+from transfpro.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class ConnectionTab(QWidget):
         super().__init__(parent)
         self.ssh_manager = ssh_manager
         self.database = database
+        self._settings = Settings()
         self.profiles: List[ConnectionProfile] = []
         self.current_profile: Optional[ConnectionProfile] = None
         self.is_connected = False
@@ -462,6 +464,142 @@ class ConnectionTab(QWidget):
         twofa_card.setLayout(twofa_layout)
         layout.addWidget(twofa_card)
 
+        # ── Settings Card ──
+        settings_card = QGroupBox("Settings")
+        settings_layout = QVBoxLayout()
+        settings_layout.setSpacing(0)
+        settings_layout.setContentsMargins(4, 8, 4, 8)
+
+        _SECTION_LABEL_QSS = (
+            "color: #8aadf4; font-weight: 700; font-size: 11px;"
+            "letter-spacing: 0.6px; padding: 6px 0 4px 0;"
+            "background: transparent;"
+        )
+        _SEPARATOR_QSS = (
+            "background-color: #363a4f; margin: 6px 0;"
+        )
+        _SETTING_ROW_QSS = (
+            "background: transparent; padding: 3px 0;"
+        )
+        _SETTING_LABEL_QSS = (
+            "color: #a5adcb; font-size: 13px; background: transparent;"
+        )
+
+        def _make_separator():
+            sep = QLabel()
+            sep.setFixedHeight(1)
+            sep.setStyleSheet(_SEPARATOR_QSS)
+            return sep
+
+        def _make_setting_row(label_text, widget, tooltip=""):
+            """Create a clean row with label on left and widget on right."""
+            row = QHBoxLayout()
+            row.setContentsMargins(4, 4, 4, 4)
+            label = QLabel(label_text)
+            label.setStyleSheet(_SETTING_LABEL_QSS)
+            if tooltip:
+                label.setToolTip(tooltip)
+                widget.setToolTip(tooltip)
+            row.addWidget(label)
+            row.addStretch()
+            row.addWidget(widget)
+            container = QWidget()
+            container.setStyleSheet(_SETTING_ROW_QSS)
+            container.setLayout(row)
+            return container
+
+        # ── Appearance Section ──
+        appear_label = QLabel("APPEARANCE")
+        appear_label.setStyleSheet(_SECTION_LABEL_QSS)
+        settings_layout.addWidget(appear_label)
+
+        # Font size: simple A- / A+ buttons
+        _BTN_QSS = (
+            "QPushButton { background: #363a4f; color: #cad3f5;"
+            " border: 1px solid #494d64; border-radius: 4px;"
+            " padding: 2px 10px; font-weight: 700; }"
+            "QPushButton:hover { background: #494d64; }"
+            "QPushButton:pressed { background: #5b6078; }"
+        )
+        font_row = QHBoxLayout()
+        font_row.setContentsMargins(4, 4, 4, 4)
+        font_label = QLabel("Text size")
+        font_label.setStyleSheet(_SETTING_LABEL_QSS)
+        font_row.addWidget(font_label)
+        font_row.addStretch()
+
+        self._font_down_btn = QPushButton("A\u2212")  # A−
+        self._font_down_btn.setFixedSize(36, 28)
+        self._font_down_btn.setStyleSheet(_BTN_QSS)
+        self._font_down_btn.setToolTip("Decrease text size")
+        self._font_down_btn.clicked.connect(lambda: self._change_font_size(-1))
+        font_row.addWidget(self._font_down_btn)
+
+        self._font_up_btn = QPushButton("A+")
+        self._font_up_btn.setFixedSize(36, 28)
+        self._font_up_btn.setStyleSheet(_BTN_QSS)
+        self._font_up_btn.setToolTip("Increase text size")
+        self._font_up_btn.clicked.connect(lambda: self._change_font_size(1))
+        font_row.addWidget(self._font_up_btn)
+
+        font_container = QWidget()
+        font_container.setStyleSheet(_SETTING_ROW_QSS)
+        font_container.setLayout(font_row)
+        settings_layout.addWidget(font_container)
+
+        settings_layout.addWidget(_make_separator())
+
+        # ── Behavior Section ──
+        behav_label = QLabel("BEHAVIOR")
+        behav_label.setStyleSheet(_SECTION_LABEL_QSS)
+        settings_layout.addWidget(behav_label)
+
+        self.confirm_exit_check = QCheckBox()
+        self.confirm_exit_check.setChecked(
+            bool(self._settings.get_value("appearance/confirm_exit", True))
+        )
+        self.confirm_exit_check.stateChanged.connect(
+            lambda state: self._settings.set_value(
+                "appearance/confirm_exit", state == Qt.Checked
+            )
+        )
+        settings_layout.addWidget(
+            _make_setting_row("Confirm before exit", self.confirm_exit_check,
+                              "Show confirmation dialog when closing")
+        )
+
+        self.notifications_check = QCheckBox()
+        self.notifications_check.setChecked(
+            bool(self._settings.get_value("appearance/notifications", True))
+        )
+        self.notifications_check.stateChanged.connect(
+            lambda state: self._settings.set_value(
+                "appearance/notifications", state == Qt.Checked
+            )
+        )
+        settings_layout.addWidget(
+            _make_setting_row("Desktop notifications", self.notifications_check,
+                              "Show desktop notifications for events")
+        )
+
+        self.sound_alerts_check = QCheckBox()
+        self.sound_alerts_check.setChecked(
+            bool(self._settings.get_value("appearance/sound_alerts", False))
+        )
+        self.sound_alerts_check.stateChanged.connect(
+            lambda state: self._settings.set_value(
+                "appearance/sound_alerts", state == Qt.Checked
+            )
+        )
+        settings_layout.addWidget(
+            _make_setting_row("Sound alerts", self.sound_alerts_check,
+                              "Play sounds for transfers and errors")
+        )
+
+        settings_layout.addStretch()
+        settings_card.setLayout(settings_layout)
+        layout.addWidget(settings_card)
+
         # ── Connect / Disconnect buttons ──
         action_layout = QHBoxLayout()
         action_layout.setSpacing(10)
@@ -525,7 +663,13 @@ class ConnectionTab(QWidget):
         layout.addStretch()
 
         panel.setLayout(layout)
-        return panel
+
+        # Wrap in scroll area so all cards remain accessible
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        return scroll
 
     def _create_log_card(self) -> QWidget:
         """Create the connection log card."""
@@ -814,6 +958,65 @@ class ConnectionTab(QWidget):
         if hasattr(self, '_anim_timer'):
             self._anim_timer.stop()
 
+    def _change_font_size(self, delta: int):
+        """Increase or decrease font size by *delta* and apply globally."""
+        if getattr(self, '_applying_font', False):
+            return
+        current = int(self._settings.get_value("appearance/font_size", 13))
+        new_size = max(8, min(24, current + delta))
+        if new_size == current:
+            return
+        self._settings.set_value("appearance/font_size", new_size)
+        self._applying_font = True
+        QTimer.singleShot(0, lambda: self._apply_font_size(new_size))
+
+    def _apply_font_size(self, size: int):
+        """Apply font size globally — app font, theme QSS, inline styles,
+        and terminal monospace fonts."""
+        try:
+            app = QApplication.instance()
+            if not app:
+                return
+            # Set the application-wide default font
+            font = app.font()
+            font.setPointSize(size)
+            app.setFont(font)
+            # Re-apply theme + scale all inline stylesheets
+            main_win = self.window()
+            if main_win and hasattr(main_win, '_apply_theme'):
+                main_win._apply_theme(font_size=size)
+            # Scale terminal monospace fonts (they use QFont, not QSS)
+            if main_win:
+                self._scale_terminal_fonts(main_win, size)
+        finally:
+            self._applying_font = False
+
+    def _scale_terminal_fonts(self, main_win, size: int):
+        """Update monospace fonts on terminal widgets to match *size*."""
+        from PyQt5.QtWidgets import QPlainTextEdit
+        # Terminal tabs use _base_font_size; scale relative to 13 baseline
+        delta = size - 13
+        for attr_name in ('terminal_tab',):
+            tab = main_win.tabs.get(attr_name)
+            if tab and hasattr(tab, '_base_font_size'):
+                new_mono = max(8, 11 + delta)
+                tab._base_font_size = new_mono
+                if hasattr(tab, 'terminal_display'):
+                    tab.terminal_display.setFont(
+                        tab._get_monospace_font(new_mono))
+        # Mini-terminals in the file transfer tab
+        ft_tab = main_win.tabs.get('file_transfer')
+        if ft_tab:
+            from transfpro.ui.widgets.mini_terminal import MiniTerminal
+            for mt in ft_tab.findChildren(MiniTerminal):
+                if hasattr(mt, '_output') and mt._output:
+                    mono_size = max(8, 11 + delta)
+                    mt._output.setFont(
+                        mt._get_monospace_font(mono_size)
+                        if hasattr(mt, '_get_monospace_font')
+                        else QApplication.instance().font()
+                    )
+
     def _on_connect(self):
         """Handle connect button click."""
         if not self.current_profile:
@@ -930,6 +1133,8 @@ class ConnectionTab(QWidget):
 
     def _on_ssh_disconnected(self):
         """Handle SSH disconnection."""
+        if getattr(self, '_shutdown_done', False):
+            return  # Skip UI updates during app shutdown
         was_connected = self.is_connected
         self.is_connected = False
         self.status_light.set_color("red")
@@ -969,11 +1174,18 @@ class ConnectionTab(QWidget):
 
     def closeEvent(self, event):
         """Ensure background threads are stopped before widget destruction."""
+        if hasattr(self, '_anim_timer'):
+            self._anim_timer.stop()
+        if getattr(self, '_shutdown_done', False):
+            super().closeEvent(event)
+            return
+
+        # Standalone close (tab destroyed independently)
         for attr in ('connection_thread', '_disconnect_thread'):
             thread = getattr(self, attr, None)
             if thread is not None and thread.isRunning():
                 thread.quit()
-                if not thread.wait(3000):
+                if not thread.wait(500):
                     thread.terminate()
-                    thread.wait(1000)
+                    thread.wait(200)
         super().closeEvent(event)

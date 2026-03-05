@@ -34,7 +34,7 @@ except ImportError:
     _HAS_GROMACS = False
 from transfpro.config.settings import Settings
 from transfpro.config.constants import APP_VERSION
-from transfpro.config.themes import DARK_THEME_QSS, LIGHT_THEME_QSS
+from transfpro.config.themes import DARK_THEME_QSS, LIGHT_THEME_QSS, scale_theme
 
 # Import UI components
 from transfpro.ui.widgets.connection_tab import ConnectionTab
@@ -352,8 +352,15 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error saving window state: {e}")
 
-    def _apply_theme(self):
-        """Apply theme from settings."""
+    def _apply_theme(self, font_size: int = 0):
+        """Apply theme from settings, scaling font sizes to *font_size*.
+
+        Scales both the main theme QSS **and** every child widget's inline
+        stylesheet so that the entire UI responds to font-size changes.
+
+        Args:
+            font_size: Base font size in pt.  0 means read from settings.
+        """
         try:
             theme = self.settings.get_theme()
             if theme == "dark":
@@ -361,11 +368,45 @@ class MainWindow(QMainWindow):
             else:
                 stylesheet = LIGHT_THEME_QSS
 
+            if font_size <= 0:
+                font_size = int(self.settings.get_value(
+                    "appearance/font_size", 13))
+            stylesheet = scale_theme(stylesheet, font_size)
+
             self.setStyleSheet(stylesheet)
-            logger.info(f"Theme '{theme}' applied")
+
+            # Scale inline stylesheets on all child widgets so that
+            # hardcoded font-size values in setStyleSheet() calls
+            # are proportionally adjusted.
+            self._scale_inline_styles(font_size)
+
+            logger.info(f"Theme '{theme}' applied (font {font_size}pt)")
 
         except Exception as e:
             logger.error(f"Error applying theme: {e}")
+
+    def _scale_inline_styles(self, font_size: int):
+        """Walk every child widget and scale any inline font-size values."""
+        from PyQt5.QtWidgets import QWidget
+        import re
+        _FS_RE = re.compile(r'font-size:\s*(\d+)(px|pt)')
+        delta = font_size - 13  # 13 is the authored baseline
+
+        if delta == 0:
+            return
+
+        def _scale(m: re.Match) -> str:
+            orig = int(m.group(1))
+            unit = m.group(2)
+            scaled = max(7, orig + delta)
+            return f'font-size: {scaled}{unit}'
+
+        for child in self.findChildren(QWidget):
+            ss = child.styleSheet()
+            if ss and _FS_RE.search(ss):
+                scaled_ss = _FS_RE.sub(_scale, ss)
+                if scaled_ss != ss:
+                    child.setStyleSheet(scaled_ss)
 
     # Slot methods for menu actions
 
@@ -700,15 +741,30 @@ class MainWindow(QMainWindow):
         self.hide()
 
     def closeEvent(self, event):
-        """Handle window close event.
+        """Handle window close — robust, non-blocking shutdown.
 
-        Uses a two-phase shutdown so all threads are signalled to stop
-        first (non-blocking), then one short combined wait replaces the
-        old per-tab sequential waits that could add up to 30+ seconds.
+        Key insight: paramiko's Channel.close() can block indefinitely
+        waiting for SSH_MSG_CHANNEL_CLOSE acknowledgement.  We NEVER
+        call channel.close() on the main thread.  Instead we:
+
+        1. Mark all widgets ``_shutdown_done`` to kill signal cascades.
+        2. Tell every reader thread to stop (``_running = False``).
+        3. Kill the SSH transport socket to force-unblock all paramiko
+           channel operations (recv, recv_ready, close) instantly.
+        4. Short wait on threads, force-terminate stragglers.
+        5. Full SSH cleanup on a daemon thread (fire-and-forget).
         """
-        # Check if confirm_exit setting is enabled
-        confirm_exit = self.settings.get_value("appearance/confirm_exit", True)
+        # ── Re-entrancy guard ──
+        # processEvents() or the confirmation dialog can dispatch a
+        # second QCloseEvent while we are still inside the first one.
+        # The second invocation would race with our cleanup (e.g.
+        # os.close(fd) while the first call hasn't finished) and hang.
+        if getattr(self, '_close_in_progress', False):
+            event.ignore()
+            return
+        self._close_in_progress = True
 
+        confirm_exit = self.settings.get_value("appearance/confirm_exit", True)
         if confirm_exit:
             reply = QMessageBox.question(
                 self,
@@ -717,23 +773,60 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No
             )
-
             if reply != QMessageBox.Yes:
+                self._close_in_progress = False
                 event.ignore()
                 return
 
-        # Save window state
         self._save_window_state()
 
-        # Cleanup resources
         try:
+            import time
+            import threading
+
+            # ── STEP 0: Hide system tray icon ──
+            # A visible QSystemTrayIcon keeps the Qt event loop alive
+            # even after the last window is closed.  Hide it early.
+            if hasattr(self, 'tray_icon') and self.tray_icon:
+                self.tray_icon.hide()
+
+            # ── STEP 1: Mark EVERY widget _shutdown_done ──
+            self._mark_all_shutdown()
+
+            # ── STEP 2: Disable QPlainTextEdit cursor-blink timers ──
+            from PyQt5.QtWidgets import QPlainTextEdit
+            for pte in self.findChildren(QPlainTextEdit):
+                pte.setCursorWidth(0)
+                pte.setReadOnly(True)
+                pte.hide()
+
+            # ── STEP 3: Disconnect ALL reader-thread signals ──
+            self._disconnect_all_reader_signals()
+
+            # ── STEP 4: Stop timers ──
             self.scheduler.stop_all()
             self.refresh_timer.stop()
 
-            # ── Phase 1: signal everything to stop (non-blocking) ──
-            all_threads = []  # collect all QThreads for a single wait pass
+            # ── STEP 5: Kill I/O sources FIRST ──
+            # This must happen BEFORE we tell threads to quit/stop,
+            # because threads blocked on paramiko channel.recv() or
+            # SFTP reads will not respond to quit()/stop() until the
+            # underlying I/O unblocks.  Killing the socket and local
+            # fds makes every blocked read fail instantly with
+            # EOFError/OSError.
+            self._close_local_fds()
+            self._kill_ssh_socket()
 
-            # Job manager tab
+            # Detach the disconnected callback so the keepalive timer
+            # (if it fires during teardown) does not emit signals into
+            # a half-destroyed UI.
+            self.ssh_manager.on_disconnected = None
+
+            # ── STEP 6: Signal reader threads to stop ──
+            all_threads = []
+            self._signal_all_readers_stop(all_threads)
+
+            # ── STEP 7: Collect and quit all worker QThreads ──
             jm = self.tabs.get('job_manager')
             if jm:
                 if getattr(jm, 'refresh_timer', None):
@@ -749,10 +842,18 @@ class MainWindow(QMainWindow):
                         t.quit()
                         all_threads.append(t)
 
-            # File transfer tab
+            ct = self.tabs.get('connection')
+            if ct:
+                if hasattr(ct, '_anim_timer'):
+                    ct._anim_timer.stop()
+                for attr in ('connection_thread', '_disconnect_thread'):
+                    t = getattr(ct, attr, None)
+                    if t and t.isRunning():
+                        t.quit()
+                        all_threads.append(t)
+
             ft = self.tabs.get('file_transfer')
             if ft:
-                # Cancel all transfer workers (wakes paused ones too)
                 for worker in list(getattr(ft, 'transfer_workers', {}).values()):
                     try:
                         worker.cancel()
@@ -763,7 +864,6 @@ class MainWindow(QMainWindow):
                         t.quit()
                         all_threads.append(t)
 
-                # Signal browser threads to quit
                 for pane_name in ('local_pane', 'remote_pane'):
                     pane = getattr(ft, pane_name, None)
                     if pane:
@@ -772,60 +872,32 @@ class MainWindow(QMainWindow):
                             bt.quit()
                             all_threads.append(bt)
 
-                # Stop mini-terminal readers (closes channels to unblock)
-                for term_name in ('local_terminal', 'remote_terminal'):
-                    term = getattr(ft, term_name, None)
-                    if term:
-                        try:
-                            term.disconnect_terminal()
-                        except Exception:
-                            pass
-
-            # Terminal tab
-            tt = self.tabs.get('terminal')
-            if tt:
-                try:
-                    tt.disconnect_terminal()
-                except Exception:
-                    pass
-
-            # ── Phase 2: one combined wait (1s total, not per-thread) ──
-            import time
-            deadline = time.monotonic() + 1.0
+            # ── STEP 8: Wait for threads (0.5 s budget) ──
+            # With the socket already dead, blocked I/O has already
+            # failed and threads should exit almost immediately.
+            deadline = time.monotonic() + 0.5
             for t in all_threads:
                 remaining = max(0, int((deadline - time.monotonic()) * 1000))
                 if t.isRunning() and remaining > 0:
                     t.wait(remaining)
 
-            # ── Phase 3: terminate stragglers ──
+            # ── STEP 9: Force-terminate stragglers ──
             for t in all_threads:
                 if t.isRunning():
                     logger.warning(f"Force-terminating thread: {t}")
                     t.terminate()
 
-            # ── Phase 4: clean up Qt objects ──
+            # ── STEP 10: Null out Qt objects ──
             if ft:
                 for pane_name in ('local_pane', 'remote_pane'):
                     pane = getattr(ft, pane_name, None)
                     if pane:
-                        bw = getattr(pane, '_browser_worker', None)
-                        bt = getattr(pane, '_browser_thread', None)
-                        if bw:
-                            try:
-                                bw.deleteLater()
-                            except RuntimeError:
-                                pass
-                        if bt:
-                            try:
-                                bt.deleteLater()
-                            except RuntimeError:
-                                pass
-                            pane._browser_thread = None
+                        pane._browser_thread = None
+                        pane._browser_worker = None
                 ft.transfer_threads.clear()
                 ft.transfer_workers.clear()
 
-            # SSH disconnect — fire and forget with daemon thread
-            import threading
+            # ── STEP 11: Full SSH cleanup on daemon thread ──
             threading.Thread(
                 target=self.ssh_manager.disconnect, daemon=True
             ).start()
@@ -835,6 +907,181 @@ class MainWindow(QMainWindow):
             logger.error(f"Error during cleanup: {e}")
 
         event.accept()
+
+        # Ensure the Qt event loop exits even if something (e.g. an
+        # orphaned timer or hidden widget) would otherwise keep it alive.
+        QApplication.instance().quit()
+
+        # ── Last-resort hard exit ──
+        # If QApplication.quit() fails to terminate the event loop
+        # (e.g. a QThread or system-tray artefact keeps it alive),
+        # or if Python's shutdown hangs on threading._shutdown() /
+        # paramiko's atexit handler, force-kill the process.
+        # Uses a daemon thread so it doesn't block normal exit.
+        import os as _os
+        def _force_exit():
+            import time
+            time.sleep(2)
+            _os._exit(0)
+        threading.Thread(target=_force_exit, daemon=True).start()
+
+    def _disconnect_all_reader_signals(self):
+        """Disconnect every reader-thread signal to prevent new queuing."""
+        # Full terminal tab
+        tt = self.tabs.get('terminal')
+        if tt:
+            reader = getattr(tt, 'reader_thread', None)
+            if reader:
+                for sig_name in ('data_received', 'error_occurred',
+                                 'channel_closed'):
+                    sig = getattr(reader, sig_name, None)
+                    if sig:
+                        try:
+                            sig.disconnect()
+                        except (TypeError, RuntimeError):
+                            pass
+
+        # Mini-terminals inside file_transfer tab
+        ft = self.tabs.get('file_transfer')
+        if ft:
+            for term_name in ('local_terminal', 'remote_terminal'):
+                term = getattr(ft, term_name, None)
+                if not term:
+                    continue
+                reader = getattr(term, '_reader', None)
+                if reader:
+                    for sig_name in ('data_received', 'closed'):
+                        sig = getattr(reader, sig_name, None)
+                        if sig:
+                            try:
+                                sig.disconnect()
+                            except (TypeError, RuntimeError):
+                                pass
+
+    def _signal_all_readers_stop(self, all_threads):
+        """Set _running = False on every reader thread (non-blocking).
+
+        Collects the QThread objects into ``all_threads`` for later
+        wait/terminate.  Does NOT call channel.close() — that can
+        block on network I/O.
+        """
+        # Terminal tab reader
+        tt = self.tabs.get('terminal')
+        if tt:
+            reader = getattr(tt, 'reader_thread', None)
+            if reader:
+                reader._running = False
+                if reader.isRunning():
+                    all_threads.append(reader)
+
+        # Mini-terminal readers
+        ft = self.tabs.get('file_transfer')
+        if ft:
+            for term_name in ('local_terminal', 'remote_terminal'):
+                term = getattr(ft, term_name, None)
+                if not term:
+                    continue
+                reader = getattr(term, '_reader', None)
+                if reader:
+                    reader._running = False
+                    if reader.isRunning():
+                        all_threads.append(reader)
+
+    def _close_local_fds(self):
+        """Kill local subprocesses and close PTY file descriptors.
+
+        IMPORTANT: Kill the subprocess FIRST, then close the fd.
+        On macOS, calling os.close(fd) while another thread is blocked
+        in os.read(fd) has undefined behaviour and can deadlock.
+        Killing the process closes the slave end of the PTY, which
+        sends EOF to the master end, unblocking the reader thread's
+        os.read() — only then is it safe to close the master fd.
+        """
+        import os
+        import signal
+        ft = self.tabs.get('file_transfer')
+        if not ft:
+            return
+        for term_name in ('local_terminal', 'remote_terminal'):
+            term = getattr(ft, term_name, None)
+            if not term:
+                continue
+
+            # Kill subprocess FIRST — this unblocks os.read() on the
+            # master fd by closing the slave end of the PTY.
+            proc = getattr(term, '_process', None)
+            if proc:
+                try:
+                    # Kill the entire process group (setsid was used at
+                    # spawn time) so child processes also die.
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+                try:
+                    proc.wait(timeout=0.2)
+                except Exception:
+                    pass
+                term._process = None
+
+            fd = getattr(term, '_master_fd', -1)
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                term._master_fd = -1
+
+    def _kill_ssh_socket(self):
+        """Shut down the raw TCP socket under the SSH transport.
+
+        This force-unblocks every paramiko channel operation (recv,
+        recv_ready, close) instantly without waiting for SSH protocol
+        handshakes.  The transport will raise EOFError / OSError in
+        any thread that's blocked on channel I/O.
+        """
+        import socket
+        try:
+            transport = (
+                self.ssh_manager._transport
+                or (self.ssh_manager._client.get_transport()
+                    if self.ssh_manager._client else None)
+            )
+            if transport and hasattr(transport, 'sock') and transport.sock:
+                try:
+                    transport.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    transport.sock.close()
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+    def _mark_all_shutdown(self):
+        """Recursively mark every tab and nested widget as shutting down.
+
+        This must happen BEFORE any cleanup so that signal handlers
+        (auto-reconnect, connection_changed cascades, channel_closed
+        handlers) immediately bail out instead of starting new work.
+        """
+        # Top-level tabs
+        for tab in self.tabs.values():
+            tab._shutdown_done = True
+
+        # Nested widgets inside file_transfer tab
+        ft = self.tabs.get('file_transfer')
+        if ft:
+            for attr in ('local_pane', 'remote_pane',
+                         'local_terminal', 'remote_terminal'):
+                widget = getattr(ft, attr, None)
+                if widget:
+                    widget._shutdown_done = True
+
+        # Terminal tab itself
+        tt = self.tabs.get('terminal')
+        if tt:
+            tt._shutdown_done = True
 
     def changeEvent(self, event):
         """Handle window state changes."""

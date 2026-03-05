@@ -18,7 +18,6 @@ import socket
 import struct
 import subprocess
 import sys
-import time
 from typing import Optional
 
 from PyQt5.QtWidgets import (
@@ -87,7 +86,11 @@ _ADD_BTN_QSS = """
 # ── Background reader threads ──
 
 class _RemoteReaderThread(QThread):
-    """Read from a paramiko SSH channel in the background."""
+    """Read from a paramiko SSH channel in the background.
+
+    Uses blocking ``recv()`` with a short timeout instead of
+    polling ``recv_ready()`` + ``sleep()``.
+    """
     data_received = pyqtSignal(str)
     closed = pyqtSignal()
 
@@ -98,17 +101,18 @@ class _RemoteReaderThread(QThread):
 
     def run(self):
         try:
+            self.channel.settimeout(0.05)
             while self._running and self.channel and not self.channel.closed:
                 try:
-                    if self.channel.recv_ready():
-                        data = self.channel.recv(4096)
-                        if data:
-                            self.data_received.emit(data.decode('utf-8', errors='replace'))
-                        else:
-                            break
+                    data = self.channel.recv(4096)
+                    if data:
+                        self.data_received.emit(
+                            data.decode('utf-8', errors='replace'))
                     else:
-                        time.sleep(0.02)
-                except (socket.timeout, EOFError, OSError):
+                        break
+                except socket.timeout:
+                    continue
+                except (EOFError, OSError):
                     break
                 except Exception:
                     break
@@ -119,16 +123,15 @@ class _RemoteReaderThread(QThread):
 
     def stop(self):
         self._running = False
-        if self.channel and not self.channel.closed:
-            try:
-                self.channel.close()
-            except Exception:
-                pass
-        self.wait(2000)
+        self.wait(200)
 
 
 class _LocalReaderThread(QThread):
-    """Read from a local PTY master fd in the background."""
+    """Read from a local PTY master fd in the background.
+
+    ``os.read()`` blocks until data arrives or the fd is closed,
+    so no polling or sleep is needed.
+    """
     data_received = pyqtSignal(str)
     closed = pyqtSignal()
 
@@ -143,7 +146,8 @@ class _LocalReaderThread(QThread):
                 try:
                     data = os.read(self.master_fd, 4096)
                     if data:
-                        self.data_received.emit(data.decode('utf-8', errors='replace'))
+                        self.data_received.emit(
+                            data.decode('utf-8', errors='replace'))
                     else:
                         break
                 except OSError:
@@ -156,9 +160,7 @@ class _LocalReaderThread(QThread):
 
     def stop(self):
         self._running = False
-        # Don't close the fd here — disconnect_terminal() handles that.
-        # The fd close there will unblock the os.read() in run().
-        self.wait(2000)
+        self.wait(200)
 
 
 # ── CSI tokenizer (same regex as TerminalTab) ──
@@ -474,21 +476,7 @@ class MiniTerminal(QWidget):
             self._channel.invoke_shell()
             self._channel.settimeout(0.1)
 
-            # Drain initial banner
-            time.sleep(0.3)
-            initial = b''
-            try:
-                while self._channel.recv_ready():
-                    chunk = self._channel.recv(4096)
-                    if chunk:
-                        initial += chunk
-                    else:
-                        break
-            except (socket.timeout, OSError):
-                pass
-            if initial:
-                self._on_data(initial.decode('utf-8', errors='replace'))
-
+            # Start reader immediately — it picks up the MOTD as it arrives.
             self._reader = _RemoteReaderThread(self._channel)
             self._reader.data_received.connect(self._on_data, Qt.QueuedConnection)
             self._reader.closed.connect(self._on_closed, Qt.QueuedConnection)
@@ -544,11 +532,16 @@ class MiniTerminal(QWidget):
             logger.error(f"Mini-terminal local connect failed: {e}")
 
     def disconnect_terminal(self):
-        """Tear down the shell session."""
+        """Tear down the shell session.
+
+        Closes the channel/fd BEFORE waiting on the reader thread so the
+        blocking read (os.read / channel.recv) is unblocked immediately
+        instead of waiting for the full timeout.
+        """
         self._connected = False
-        if self._reader:
-            self._reader.stop()
-            self._reader = None
+
+        # Close the I/O source first to unblock the reader thread's
+        # blocking read call — this makes stop().wait() return instantly.
         if self._channel:
             try:
                 self._channel.close()
@@ -567,6 +560,21 @@ class MiniTerminal(QWidget):
             except Exception:
                 pass
             self._process = None
+
+        # Disconnect signals first so no queued data_received calls
+        # arrive after the widget starts being destroyed (avoids
+        # "Cannot queue arguments of type QTextBlock/QTextCursor").
+        if self._reader:
+            try:
+                self._reader.data_received.disconnect()
+                self._reader.closed.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            # Now wait on the reader — it should exit almost immediately
+            # since the fd/channel is already closed.
+            self._reader.stop()
+            self._reader = None
+
         label = "Remote Shell" if self.is_remote else "Local Shell"
         self._header_label.setText(label)
         self._header_label.setStyleSheet(_LABEL_QSS)
@@ -824,6 +832,22 @@ class MiniTerminal(QWidget):
             line_len = cursor.block().length() - 1
             if col > 0:
                 cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, min(col, line_len))
+        elif final in ('H', 'f'):  # Cursor Position  \x1b[row;colH
+            row = max((params[0] if len(params) > 0 else 1), 1)
+            col = max((params[1] if len(params) > 1 else 1), 1)
+            doc = cursor.document()
+            while doc.blockCount() < row:
+                cursor.movePosition(QTextCursor.End)
+                cursor.insertText('\n')
+            block = doc.findBlockByNumber(row - 1)
+            cursor.setPosition(block.position())
+            line_len = block.length() - 1
+            if col - 1 > line_len:
+                cursor.movePosition(QTextCursor.EndOfBlock)
+                cursor.insertText(' ' * (col - 1 - line_len))
+            else:
+                cursor.movePosition(
+                    QTextCursor.Right, QTextCursor.MoveAnchor, col - 1)
         elif final == 'K':
             mode = n or 0
             if mode == 0:
@@ -841,9 +865,11 @@ class MiniTerminal(QWidget):
             if mode == 0:
                 cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
                 cursor.removeSelectedText()
-            elif mode in (1, 2):
-                cursor.movePosition(QTextCursor.Start)
-                cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+            elif mode == 1:
+                cursor.movePosition(QTextCursor.Start, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            elif mode == 2:
+                cursor.select(QTextCursor.Document)
                 cursor.removeSelectedText()
         elif final == 'P':
             cnt = max(n or 1, 1)
@@ -917,5 +943,8 @@ class MiniTerminal(QWidget):
     # ─────────────────── Cleanup ───────────────────
 
     def closeEvent(self, event):
+        if getattr(self, '_shutdown_done', False):
+            super().closeEvent(event)
+            return
         self.disconnect_terminal()
         super().closeEvent(event)

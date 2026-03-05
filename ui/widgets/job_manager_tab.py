@@ -722,28 +722,33 @@ class JobManagerTab(QWidget):
         dialog.exec_()
 
     def closeEvent(self, event):
-        """
-        Handle widget close.
+        """Handle widget close.
 
-        Args:
-            event: Close event
+        MainWindow.closeEvent already quit/terminated these threads and
+        sets ``_shutdown_done`` so we skip all redundant waits here.
         """
-        # Stop refresh timer
+        if getattr(self, '_shutdown_done', False):
+            super().closeEvent(event)
+            return
+
+        # Standalone close (tab destroyed independently of MainWindow)
         if self.refresh_timer:
             self.refresh_timer.stop()
 
-        # Stop worker threads (with bounded timeout to avoid hanging on exit)
-        if self.query_thread and self.query_thread.isRunning():
-            if self.query_worker:
-                self.query_worker.cancel()
-            self.query_thread.quit()
-            if not self.query_thread.wait(3000):
-                logger.warning("Query thread did not exit within timeout")
-
-        # Stop cancel thread
-        if self.cancel_thread and self.cancel_thread.isRunning():
-            self.cancel_thread.quit()
-            if not self.cancel_thread.wait(3000):
-                logger.warning("Cancel thread did not exit within timeout")
+        for t_attr, w_attr in [('query_thread', 'query_worker'),
+                                ('cancel_thread', None)]:
+            thread = getattr(self, t_attr, None)
+            if thread and thread.isRunning():
+                if w_attr:
+                    worker = getattr(self, w_attr, None)
+                    if worker:
+                        try:
+                            worker.cancel()
+                        except RuntimeError:
+                            pass
+                thread.quit()
+                if not thread.wait(500):
+                    thread.terminate()
+                    thread.wait(200)
 
         super().closeEvent(event)
