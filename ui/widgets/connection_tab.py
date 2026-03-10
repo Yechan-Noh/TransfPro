@@ -708,7 +708,7 @@ class ConnectionTab(QWidget):
             self.ssh_manager.on_disconnected = lambda: self._server_disconnected.emit()
             self.ssh_manager.on_error = lambda msg: self._log_message(f"SSH Error: {msg}")
 
-    # ── Password persistence (system keyring) ──
+    # ── Password persistence (local encrypted store) ──
 
     _KEYRING_SERVICE = "TransfPro"
 
@@ -717,41 +717,31 @@ class ConnectionTab(QWidget):
         return f"{profile.username}@{profile.host}:{profile.port}"
 
     def _save_password(self, profile: ConnectionProfile, password: str):
-        """Save password to system keyring (macOS Keychain, etc.)."""
+        """Save password to local password store."""
         try:
-            import keyring
-            keyring.set_password(
-                self._KEYRING_SERVICE,
-                self._pw_key(profile),
-                password,
-            )
-            logger.debug("Password saved to system keyring")
+            from transfpro.core.password_store import set_password
+            set_password(self._KEYRING_SERVICE, self._pw_key(profile), password)
+            logger.debug("Password saved to local store")
         except Exception as e:
-            logger.warning(f"Could not save password to keyring: {e}")
+            logger.warning(f"Could not save password: {e}")
 
     def _load_password(self, profile: ConnectionProfile) -> Optional[str]:
-        """Load a saved password from system keyring."""
+        """Load a saved password from local password store."""
         try:
-            import keyring
-            return keyring.get_password(
-                self._KEYRING_SERVICE,
-                self._pw_key(profile),
-            )
+            from transfpro.core.password_store import get_password
+            return get_password(self._KEYRING_SERVICE, self._pw_key(profile))
         except Exception as e:
-            logger.warning(f"Could not load password from keyring: {e}")
+            logger.warning(f"Could not load password: {e}")
             return None
 
     def _delete_password(self, profile: ConnectionProfile):
-        """Delete a saved password from system keyring."""
+        """Delete a saved password from local password store."""
         try:
-            import keyring
-            keyring.delete_password(
-                self._KEYRING_SERVICE,
-                self._pw_key(profile),
-            )
-            logger.debug("Password deleted from system keyring")
+            from transfpro.core.password_store import delete_password
+            delete_password(self._KEYRING_SERVICE, self._pw_key(profile))
+            logger.debug("Password deleted from local store")
         except Exception as e:
-            logger.debug(f"Could not delete password from keyring: {e}")
+            logger.debug(f"Could not delete password: {e}")
 
     def _load_profiles(self):
         """Load connection profiles from database."""
@@ -959,16 +949,27 @@ class ConnectionTab(QWidget):
             self._anim_timer.stop()
 
     def _change_font_size(self, delta: int):
-        """Increase or decrease font size by *delta* and apply globally."""
-        if getattr(self, '_applying_font', False):
-            return
+        """Increase or decrease font size by *delta* and apply globally.
+
+        Uses a debounce timer so rapid clicks coalesce into a single apply.
+        """
         current = int(self._settings.get_value("appearance/font_size", 13))
         new_size = max(8, min(24, current + delta))
         if new_size == current:
             return
         self._settings.set_value("appearance/font_size", new_size)
-        self._applying_font = True
-        QTimer.singleShot(0, lambda: self._apply_font_size(new_size))
+        # Debounce: restart timer on each click so only the last size applies
+        if not hasattr(self, '_font_debounce'):
+            self._font_debounce = QTimer(self)
+            self._font_debounce.setSingleShot(True)
+            self._font_debounce.setInterval(150)
+            self._font_debounce.timeout.connect(self._apply_debounced_font)
+        self._font_debounce.start()
+
+    def _apply_debounced_font(self):
+        """Called by debounce timer — reads the current setting and applies."""
+        size = int(self._settings.get_value("appearance/font_size", 13))
+        self._apply_font_size(size)
 
     def _apply_font_size(self, size: int):
         """Apply font size globally — app font, theme QSS, inline styles,
@@ -988,8 +989,8 @@ class ConnectionTab(QWidget):
             # Scale terminal monospace fonts (they use QFont, not QSS)
             if main_win:
                 self._scale_terminal_fonts(main_win, size)
-        finally:
-            self._applying_font = False
+        except Exception as e:
+            logger.error(f"Error applying font size: {e}")
 
     def _scale_terminal_fonts(self, main_win, size: int):
         """Update monospace fonts on terminal widgets to match *size*."""

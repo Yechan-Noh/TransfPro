@@ -1,62 +1,84 @@
 """
-Embedded SSH Terminal Emulator for TransfPro.
+Dual-pane Terminal Tab for TransfPro.
 
-This module provides an interactive SSH terminal embedded in the main window,
-featuring basic VT100 escape code handling, quick SLURM commands, search,
-and real-time output streaming from remote SSH channels.
+Each side is driven by the corresponding File Transfer pane's connection.
+When the File Transfer pane connects to Local or a cluster, MainWindow
+signals this tab to open a terminal session using the same SSH transport
+(new channel) or a local PTY.  When disconnected, the terminal is cleared
+and a waiting placeholder is shown.
+
+Features: VT100 / ANSI-colour handling, search, customisable
+quick-command buttons, and font-size controls.
 """
 
 import logging
-import socket
+import os
+import pty
 import re
+import select
+import signal as _signal
+import socket
+import struct
+import subprocess
+import sys
+import time as _time
 from typing import Optional, List
-from collections import deque
+
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPlainTextEdit, QPushButton,
-    QToolBar, QLabel, QMessageBox, QSizePolicy, QLineEdit,
-    QApplication, QMenu, QInputDialog, QDialog,
-    QFormLayout, QDialogButtonBox
+    QLabel, QSizePolicy, QLineEdit, QSplitter, QStackedWidget,
+    QApplication, QMenu, QInputDialog, QDialog, QMessageBox,
+    QFormLayout, QDialogButtonBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QThread, QSize, QSettings, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QSize, QSettings, QTimer, QEvent
 from PyQt5.QtGui import (
-    QFont, QColor, QTextCursor, QTextCharFormat, QTextDocument
+    QFont, QColor, QTextCursor, QTextCharFormat, QTextDocument,
 )
-import paramiko
+
+from transfpro.core.database import Database
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of document blocks (lines) before old lines are trimmed
 MAX_SCROLLBACK_LINES = 10000
 
-# ── Compact button styles (override global theme) ──
-_TERM_BTN_STYLE = """
-    QPushButton {
-        background: #24273a;
-        color: #cad3f5;
-        border: 1px solid #363a4f;
-        border-radius: 4px;
-        padding: 3px 10px;
-        font-size: 12px;
-        font-weight: 600;
+# ── Styles ──────────────────────────────────────────────────────────
+
+_TOOLBAR_QSS = """
+    QWidget {
+        background: #1e2030;
+        border-bottom: 1px solid rgba(73, 77, 100, 0.3);
     }
-    QPushButton:hover { background: #363a4f; }
-    QPushButton:pressed { background: #1a1b26; }
 """
 
+_BTN_QSS = """
+    QPushButton {
+        background: rgba(138, 173, 244, 0.08);
+        color: #8aadf4;
+        border: 1px solid rgba(138, 173, 244, 0.2);
+        border-radius: 4px;
+        padding: 3px 10px;
+        font-size: 11px;
+        font-weight: 600;
+    }
+    QPushButton:hover { background: rgba(138, 173, 244, 0.18); }
+    QPushButton:pressed { background: rgba(138, 173, 244, 0.06); }
+"""
 
+_DISCONNECT_BTN_QSS = """
+    QPushButton {
+        background: rgba(237, 135, 150, 0.08);
+        color: #ed8796;
+        border: 1px solid rgba(237, 135, 150, 0.2);
+        border-radius: 4px;
+        padding: 3px 10px;
+        font-size: 11px;
+        font-weight: 600;
+    }
+    QPushButton:hover { background: rgba(237, 135, 150, 0.18); }
+    QPushButton:pressed { background: rgba(237, 135, 150, 0.06); }
+"""
 
-
-
-
-
-
-
-
-
-
-
-
-_QUICK_BTN_STYLE = """
+_QUICK_BTN_QSS = """
     QPushButton {
         background: rgba(14, 165, 233, 0.1);
         color: #7dc4e4;
@@ -70,660 +92,835 @@ _QUICK_BTN_STYLE = """
     QPushButton:pressed { background: rgba(14, 165, 233, 0.05); }
 """
 
-_SEND_BTN_STYLE = """
-    QPushButton {
-        background: rgba(166, 218, 149, 0.1);
-        color: #a6da95;
-        border: 1px solid rgba(166, 218, 149, 0.2);
-        border-radius: 3px;
-        padding: 2px 10px;
-        font-size: 11px;
-        font-weight: 600;
+_TERM_QSS = """
+    QPlainTextEdit {
+        background-color: #1e1e1e;
+        color: #cccccc;
+        border: none;
+        padding: 5px;
+        selection-background-color: #264f78;
+        selection-color: #ffffff;
     }
-    QPushButton:hover { background: rgba(166, 218, 149, 0.2); }
-    QPushButton:pressed { background: rgba(166, 218, 149, 0.05); }
 """
 
+_SEARCH_BAR_QSS = "background-color: #2a2a2e;"
 
-class TerminalReaderThread(QThread):
-    """Background thread that reads data from SSH channel.
+_PLACEHOLDER_QSS = """
+    QWidget#placeholder {
+        background: qlineargradient(
+            x1:0, y1:0, x2:1, y2:1,
+            stop:0 #1e2030, stop:1 #181926
+        );
+    }
+"""
 
-    Uses a blocking ``recv()`` with a short timeout instead of
-    polling ``recv_ready()`` + ``sleep()``.  The channel timeout
-    is set to 0.05 s so the loop checks ``_running`` ~20 times/s.
-    """
+# ── Reader threads ──────────────────────────────────────────────────
 
+class _RemoteReaderThread(QThread):
     data_received = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-    channel_closed = pyqtSignal()
+    closed = pyqtSignal()
 
-    def __init__(self, channel: paramiko.Channel):
+    def __init__(self, channel):
         super().__init__()
         self.channel = channel
         self._running = True
 
     def run(self):
         try:
-            # Short blocking timeout — recv() will return b'' on
-            # timeout, letting us check _running frequently.
             self.channel.settimeout(0.05)
-
             while self._running and self.channel and not self.channel.closed:
                 try:
                     data = self.channel.recv(4096)
                     if data:
-                        self.data_received.emit(
-                            data.decode('utf-8', errors='replace'))
+                        self.data_received.emit(data.decode('utf-8', errors='replace'))
                     else:
-                        break  # EOF — channel closed by remote
+                        break
                 except socket.timeout:
-                    continue  # no data yet — loop back and check _running
-                except EOFError:
+                    continue
+                except (EOFError, OSError):
                     break
-                except OSError:
-                    break  # channel/transport closed during disconnect
                 except Exception:
                     break
-
             if self._running:
-                self.channel_closed.emit()
-
+                self.closed.emit()
         except Exception as e:
-            if self._running:
-                logger.error(f"Terminal reader thread error: {e}")
+            logger.error(f"Terminal remote reader error: {e}")
 
     def stop(self):
         self._running = False
-        self.wait(200)
+        self.wait(300)
 
 
-class TerminalTab(QWidget):
+class _LocalReaderThread(QThread):
+    data_received = pyqtSignal(str)
+    closed = pyqtSignal()
+
+    def __init__(self, master_fd: int):
+        super().__init__()
+        self.master_fd = master_fd
+        self._running = True
+
+    def run(self):
+        fd = self.master_fd
+        try:
+            while self._running:
+                try:
+                    ready, _, _ = select.select([fd], [], [], 0.1)
+                    if not ready:
+                        continue
+                    data = os.read(fd, 4096)
+                    if data:
+                        self.data_received.emit(data.decode('utf-8', errors='replace'))
+                    else:
+                        break
+                except (OSError, ValueError):
+                    break
+            if self._running:
+                self.closed.emit()
+        except Exception as e:
+            if self._running:
+                logger.error(f"Terminal local reader error: {e}")
+
+    def stop(self):
+        self._running = False
+        self.wait(500)
+
+
+# ── TerminalPane ────────────────────────────────────────────────────
+
+class TerminalPane(QWidget):
+    """A single terminal pane: waiting placeholder (page 0) + full terminal (page 1).
+
+    Connections are driven externally by MainWindow (which syncs from
+    the File Transfer tab).  No ConnectionSelector is embedded here.
     """
-    Embedded SSH terminal emulator using paramiko channel.
 
-    Features:
-    - Real-time SSH output streaming
-    - Keyboard input capture and transmission
-    - Basic VT100 escape code handling
-    - Quick command buttons (customizable)
-    - Search in terminal output (Ctrl+F)
-    - Copy selected text (Ctrl+Shift+C)
-    - Font size adjustment
-    - Reconnect button
-    - Scrollback buffer limit
-    """
-
-    connection_lost = pyqtSignal()
-
-    # Default quick commands (used on first launch)
-    _DEFAULT_QUICK_COMMANDS = [
-        ("ls -lh", "List Files"),
+    _DEFAULT_REMOTE_COMMANDS = [
+        ("ls -lh", "ls"),
+        ("squeue -u $USER", "My Jobs"),
         ("df -h .", "Disk Free"),
         ("pwd", "pwd"),
         ("whoami", "whoami"),
-        ("uname -a", "System Info"),
-        ("top -bn1 | head -20", "Top Processes"),
+        ("top -bn1 | head -20", "Top Procs"),
     ]
 
-    def __init__(self, ssh_manager, parent=None):
-        super().__init__(parent)
-        self.ssh_manager = ssh_manager
-        self.channel: Optional[paramiko.Channel] = None
-        self.reader_thread: Optional[TerminalReaderThread] = None
+    _DEFAULT_LOCAL_COMMANDS = [
+        ("ls -lh", "ls"),
+        ("du -sh *", "Disk Usage"),
+        ("pwd", "pwd"),
+    ]
 
-        # Quick commands (mutable, persisted via QSettings)
-        self._quick_commands: List[tuple] = self._load_quick_commands()
+    # ANSI color palettes
+    _ANSI_COLORS = [
+        QColor('#2e3436'), QColor('#cc0000'), QColor('#4e9a06'), QColor('#c4a000'),
+        QColor('#3465a4'), QColor('#75507b'), QColor('#06989a'), QColor('#d3d7cf'),
+    ]
+    _ANSI_BRIGHT = [
+        QColor('#555753'), QColor('#ef2929'), QColor('#8ae234'), QColor('#fce94f'),
+        QColor('#729fcf'), QColor('#ad7fa8'), QColor('#34e2e2'), QColor('#eeeeec'),
+    ]
+
+    _RE_TOKEN = re.compile(
+        r'(\x1b\[([\x20-\x3f]*)([\x40-\x7e]))'
+        r'|(\x1b\][^\x07]{0,256}(?:\x07|\x1b\\))'
+        r'|(\x1b[()][\x20-\x7e])'
+        r'|(\x1b[^[\]()])'
+    )
+
+    def __init__(self, side: str, parent=None):
+        super().__init__(parent)
+        self._side = side  # "left" or "right"
+
+        # Connection state
+        self.is_remote = False
+        self.ssh_manager = None
+        self.connected_profile = None
 
         # Terminal state
         self._connected = False
+        self._channel = None
+        self._process = None
+        self._master_fd = -1
+        self._reader: Optional[QThread] = None
+        self._erase_char = b'\x7f'
         self._base_font_size = 11
         self._search_visible = False
-        self._erase_char = b'\x7f'  # default ^? (DEL); auto-detected on connect
 
-        # SGR (Select Graphic Rendition) state for ANSI color support
-        self._sgr_fmt = QTextCharFormat()  # current text format
+        # Quick commands
+        self._quick_commands = self._load_quick_commands()
+
+        # SGR state
+        self._sgr_fmt = QTextCharFormat()
         self._sgr_default_fg = QColor('#cccccc')
         self._sgr_default_bg = QColor('#1e1e1e')
         self._sgr_fmt.setForeground(self._sgr_default_fg)
         self._sgr_bold = False
 
-        # Setup UI
         self._setup_ui()
 
-        # Connect to SSH manager signals if available
-        if hasattr(ssh_manager, 'connection_status_changed'):
-            ssh_manager.connection_status_changed.connect(self._on_connection_status_changed)
+    # ── UI ──
 
     def _setup_ui(self):
-        """Setup user interface components."""
-        main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Main toolbar
+        self._stack = QStackedWidget()
+
+        # Page 0: Waiting placeholder (no ConnectionSelector)
+        placeholder = self._create_placeholder()
+        self._stack.addWidget(placeholder)
+
+        # Page 1: Terminal view
+        self._terminal_page = QWidget()
+        term_layout = QVBoxLayout(self._terminal_page)
+        term_layout.setContentsMargins(0, 0, 0, 0)
+        term_layout.setSpacing(0)
+
+        # Toolbar
         toolbar = self._create_toolbar()
-        main_layout.addWidget(toolbar)
+        term_layout.addWidget(toolbar)
 
         # Quick commands bar
-        quick_bar = self._create_quick_commands_bar()
-        main_layout.addWidget(quick_bar)
+        self._quick_bar = self._create_quick_bar()
+        term_layout.addWidget(self._quick_bar)
 
         # Search bar (hidden by default)
-        self.search_bar = self._create_search_bar()
-        self.search_bar.setVisible(False)
-        main_layout.addWidget(self.search_bar)
+        self._search_bar = self._create_search_bar()
+        self._search_bar.hide()
+        term_layout.addWidget(self._search_bar)
 
-        # Terminal display — NOT read-only so the blinking cursor is visible;
-        # all keyboard input is intercepted by eventFilter and sent to the
-        # SSH channel instead of being inserted into the document.
-        self.terminal_display = QPlainTextEdit()
-        self.terminal_display.setReadOnly(False)
-        self.terminal_display.setFont(self._get_monospace_font(self._base_font_size))
-        self.terminal_display.setCursorWidth(2)
-        self.terminal_display.setStyleSheet("""
-            QPlainTextEdit {
-                background-color: #1e1e1e;
-                color: #cccccc;
-                border: none;
-                margin: 0px;
-                padding: 5px;
-                selection-background-color: #264f78;
-                selection-color: #ffffff;
-            }
-        """)
-        self.terminal_display.setFocusPolicy(Qt.StrongFocus)
-        self.terminal_display.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.terminal_display.customContextMenuRequested.connect(self._show_context_menu)
-        # Disable undo/redo to prevent Cmd+Z from corrupting terminal state
-        self.terminal_display.setUndoRedoEnabled(False)
+        # Terminal display
+        self.display = QPlainTextEdit()
+        self.display.setReadOnly(False)
+        self.display.setUndoRedoEnabled(False)
+        self.display.setFont(self._mono_font(self._base_font_size))
+        self.display.setCursorWidth(2)
+        self.display.setStyleSheet(_TERM_QSS)
+        self.display.setFocusPolicy(Qt.StrongFocus)
+        self.display.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.display.customContextMenuRequested.connect(self._show_context_menu)
+        self.display.installEventFilter(self)
+        term_layout.addWidget(self.display)
 
-        # Event filter for key interception
-        self.terminal_display.installEventFilter(self)
+        self._stack.addWidget(self._terminal_page)
 
-        main_layout.addWidget(self.terminal_display)
-        self.setLayout(main_layout)
+        layout.addWidget(self._stack)
+        self.setLayout(layout)
 
-    def _create_toolbar(self) -> QToolBar:
-        """Create main toolbar."""
-        toolbar = QToolBar("Terminal Controls")
-        toolbar.setIconSize(QSize(16, 16))
+    def _create_placeholder(self) -> QWidget:
+        """Create a styled waiting page that tells the user to connect via File Transfer."""
+        page = QWidget()
+        page.setObjectName("placeholder")
+        page.setStyleSheet(_PLACEHOLDER_QSS)
 
-        # Clear button
-        clear_btn = QPushButton("Clear")
-        clear_btn.setToolTip("Clear terminal screen")
-        clear_btn.setStyleSheet(_TERM_BTN_STYLE)
-        clear_btn.clicked.connect(self._on_clear_terminal)
-        toolbar.addWidget(clear_btn)
+        lay = QVBoxLayout(page)
+        lay.setAlignment(Qt.AlignCenter)
 
-        # Search button
-        search_btn = QPushButton("Find")
-        search_btn.setToolTip("Search in terminal output (Ctrl+F)")
-        search_btn.setStyleSheet(_TERM_BTN_STYLE)
-        search_btn.clicked.connect(self._toggle_search)
-        toolbar.addWidget(search_btn)
+        icon_lbl = QLabel("⌨")
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setStyleSheet("font-size: 48px; color: #494d64; margin-bottom: 6px;")
+        lay.addWidget(icon_lbl)
 
-        # Reconnect button
-        self.reconnect_btn = QPushButton("Reconnect")
-        self.reconnect_btn.setToolTip("Reconnect the terminal session")
-        self.reconnect_btn.setStyleSheet(_TERM_BTN_STYLE)
-        self.reconnect_btn.clicked.connect(self._on_reconnect)
-        toolbar.addWidget(self.reconnect_btn)
-
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        toolbar.addWidget(spacer)
-
-        # Status label
-        self.status_label = QLabel("Not connected")
-        self.status_label.setStyleSheet(
-            "color: #ff6b6b; font-weight: bold; font-size: 12px; "
-            "padding-right: 12px; margin-right: 8px;"
+        side_name = "Left" if self._side == "left" else "Right"
+        title_lbl = QLabel(f"{side_name} Terminal")
+        title_lbl.setAlignment(Qt.AlignCenter)
+        title_lbl.setStyleSheet(
+            "color: #cad3f5; font-size: 16px; font-weight: 700;"
+            " letter-spacing: 0.5px; margin-bottom: 4px;"
         )
-        toolbar.addWidget(self.status_label)
+        lay.addWidget(title_lbl)
 
-        return toolbar
+        self._placeholder_hint = QLabel(
+            "Connect to a server or local shell\n"
+            "in the File Transfer tab to open a terminal here."
+        )
+        self._placeholder_hint.setAlignment(Qt.AlignCenter)
+        self._placeholder_hint.setStyleSheet(
+            "color: #6e738d; font-size: 12px; line-height: 1.5;"
+        )
+        self._placeholder_hint.setWordWrap(True)
+        lay.addWidget(self._placeholder_hint)
 
-    def _create_quick_commands_bar(self) -> QWidget:
-        """Create the quick-commands bar with interactive buttons."""
-        self._quick_bar = QWidget()
-        self._quick_bar_layout = QHBoxLayout()
-        self._quick_bar_layout.setContentsMargins(4, 2, 4, 2)
-        self._quick_bar_layout.setSpacing(4)
-        self._quick_bar.setLayout(self._quick_bar_layout)
+        return page
+
+    def _create_toolbar(self) -> QWidget:
+        bar = QWidget()
+        bar.setStyleSheet(_TOOLBAR_QSS)
+        bar.setFixedHeight(30)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(6, 2, 6, 2)
+        lay.setSpacing(4)
+
+        # Clear
+        clear_btn = QPushButton("Clear")
+        clear_btn.setStyleSheet(_BTN_QSS)
+        clear_btn.setMaximumHeight(24)
+        clear_btn.clicked.connect(lambda: self.display.clear())
+        lay.addWidget(clear_btn)
+
+        # Find
+        find_btn = QPushButton("Find")
+        find_btn.setStyleSheet(_BTN_QSS)
+        find_btn.setMaximumHeight(24)
+        find_btn.clicked.connect(self._toggle_search)
+        lay.addWidget(find_btn)
+
+        # Font size
+        font_down = QPushButton("A-")
+        font_down.setStyleSheet(_BTN_QSS)
+        font_down.setMaximumHeight(24)
+        font_down.setFixedWidth(28)
+        font_down.clicked.connect(self._font_decrease)
+        lay.addWidget(font_down)
+
+        font_up = QPushButton("A+")
+        font_up.setStyleSheet(_BTN_QSS)
+        font_up.setMaximumHeight(24)
+        font_up.setFixedWidth(28)
+        font_up.clicked.connect(self._font_increase)
+        lay.addWidget(font_up)
+
+        lay.addStretch()
+
+        # Status
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet(
+            "color: #a6da95; font-weight: bold; font-size: 11px; padding-right: 6px;"
+        )
+        lay.addWidget(self._status_label)
+
+        return bar
+
+    def _create_quick_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setFixedHeight(26)
+        bar.setStyleSheet("background: #181926; border-bottom: 1px solid rgba(73,77,100,0.2);")
+        self._quick_bar_layout = QHBoxLayout(bar)
+        self._quick_bar_layout.setContentsMargins(6, 1, 6, 1)
+        self._quick_bar_layout.setSpacing(3)
         self._rebuild_quick_buttons()
-        return self._quick_bar
+        return bar
 
     def _rebuild_quick_buttons(self):
-        """Rebuild all quick-command buttons from current list."""
-        layout = self._quick_bar_layout
-        # Remove all existing widgets
-        while layout.count():
-            item = layout.takeAt(0)
+        lay = self._quick_bar_layout
+        while lay.count():
+            item = lay.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
 
         label = QLabel("Quick:")
-        layout.addWidget(label)
+        label.setStyleSheet("color: #6e738d; font-size: 10px; font-weight: 600;")
+        lay.addWidget(label)
 
         for idx, (cmd, btn_label) in enumerate(self._quick_commands):
             btn = QPushButton(btn_label)
-            lines = cmd.split('\n')
-            if len(lines) > 1:
-                tip = '\n'.join(lines) + f'\n\n({len(lines)} lines) — Right-click to edit or remove'
-            else:
-                tip = f"{cmd}\n\nRight-click to edit or remove"
-            btn.setToolTip(tip)
-            btn.setMaximumHeight(24)
-            btn.setStyleSheet(_QUICK_BTN_STYLE)
+            btn.setToolTip(cmd + "\n\nRight-click to edit or remove")
+            btn.setMaximumHeight(20)
+            btn.setStyleSheet(_QUICK_BTN_QSS)
             btn.setContextMenuPolicy(Qt.CustomContextMenu)
-            # Left-click: send command
             btn.clicked.connect(lambda checked, c=cmd: self._send_quick_command(c))
-            # Right-click: context menu
             btn.customContextMenuRequested.connect(
-                lambda pos, i=idx, b=btn: self._show_quick_cmd_menu(pos, i, b)
-            )
-            layout.addWidget(btn)
+                lambda pos, i=idx, b=btn: self._show_quick_menu(pos, i, b))
+            lay.addWidget(btn)
 
-        # "+" add button
         add_btn = QPushButton("+")
-        add_btn.setToolTip("Add a new quick command")
-        add_btn.setMaximumHeight(24)
-        add_btn.setFixedWidth(28)
-        add_btn.setStyleSheet(_SEND_BTN_STYLE)
+        add_btn.setToolTip("Add quick command")
+        add_btn.setMaximumHeight(20)
+        add_btn.setFixedWidth(24)
+        add_btn.setStyleSheet(_QUICK_BTN_QSS)
         add_btn.clicked.connect(self._add_quick_command)
-        layout.addWidget(add_btn)
+        lay.addWidget(add_btn)
 
-        layout.addStretch()
-
-    def _show_quick_cmd_menu(self, pos, index: int, button: QPushButton):
-        """Show context menu for a quick-command button."""
-        menu = QMenu(self)
-        edit_action = menu.addAction("Edit")
-        remove_action = menu.addAction("Remove")
-        action = menu.exec_(button.mapToGlobal(pos))
-        if action == edit_action:
-            self._edit_quick_command(index)
-        elif action == remove_action:
-            self._remove_quick_command(index)
-
-    def _add_quick_command(self):
-        """Show dialog to add a new quick command."""
-        name, command = self._quick_cmd_dialog("Add Quick Command", "", "")
-        if name and command:
-            self._quick_commands.append((command, name))
-            self._save_quick_commands()
-            self._rebuild_quick_buttons()
-
-    def _edit_quick_command(self, index: int):
-        """Show dialog to edit an existing quick command."""
-        cmd, label = self._quick_commands[index]
-        new_name, new_cmd = self._quick_cmd_dialog("Edit Quick Command", label, cmd)
-        if new_name and new_cmd:
-            self._quick_commands[index] = (new_cmd, new_name)
-            self._save_quick_commands()
-            self._rebuild_quick_buttons()
-
-    def _remove_quick_command(self, index: int):
-        """Remove a quick command after confirmation."""
-        cmd, label = self._quick_commands[index]
-        reply = QMessageBox.question(
-            self, "Remove Quick Command",
-            f'Remove "{label}"?',
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            self._quick_commands.pop(index)
-            self._save_quick_commands()
-            self._rebuild_quick_buttons()
-
-    def _quick_cmd_dialog(self, title: str, name: str, command: str):
-        """Show a dialog to enter/edit a quick command name and command.
-
-        Supports multi-line commands. Each line is sent as a separate
-        command to the terminal.
-
-        Returns:
-            (name, command) tuple, or (None, None) if cancelled.
-        """
-        dialog = QDialog(self)
-        dialog.setWindowTitle(title)
-        dialog.setMinimumWidth(480)
-        dialog.setMinimumHeight(280)
-
-        layout = QVBoxLayout()
-
-        # Name row
-        name_layout = QHBoxLayout()
-        name_layout.addWidget(QLabel("Name:"))
-        name_input = QLineEdit(name)
-        name_input.setPlaceholderText("e.g. My Jobs")
-        name_layout.addWidget(name_input)
-        layout.addLayout(name_layout)
-
-        # Command area (multi-line)
-        layout.addWidget(QLabel("Command (one per line for multi-line):"))
-        cmd_input = QPlainTextEdit()
-        cmd_input.setPlaceholderText(
-            "e.g. squeue -u $USER\n\n"
-            "For multi-line, each line is sent separately:\n"
-            "cd /scratch/$USER\n"
-            "ls -la\n"
-            "cat slurm-*.out"
-        )
-        cmd_input.setFont(self._get_monospace_font(11))
-        cmd_input.setStyleSheet("""
-            QPlainTextEdit {
-                background: #1e2030;
-                color: #cad3f5;
-                border: 1px solid #363a4f;
-                border-radius: 4px;
-                padding: 6px;
-            }
-        """)
-        # Set existing command text (convert \n to actual newlines for display)
-        cmd_input.setPlainText(command)
-        layout.addWidget(cmd_input)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        dialog.setLayout(layout)
-
-        if dialog.exec_() == QDialog.Accepted:
-            n = name_input.text().strip()
-            c = cmd_input.toPlainText().strip()
-            if n and c:
-                return n, c
-        return None, None
-
-    # ── Quick command persistence ──
-
-    def _load_quick_commands(self) -> list:
-        """Load quick commands from QSettings, or use defaults."""
-        settings = QSettings("TransfPro", "TransfPro")
-        count = settings.beginReadArray("QuickCommands")
-        if count == 0:
-            settings.endArray()
-            return list(self._DEFAULT_QUICK_COMMANDS)
-        commands = []
-        for i in range(count):
-            settings.setArrayIndex(i)
-            cmd = settings.value("command", "")
-            label = settings.value("label", "")
-            if cmd and label:
-                commands.append((cmd, label))
-        settings.endArray()
-        return commands if commands else list(self._DEFAULT_QUICK_COMMANDS)
-
-    def _save_quick_commands(self):
-        """Persist quick commands to QSettings."""
-        settings = QSettings("TransfPro", "TransfPro")
-        settings.beginWriteArray("QuickCommands", len(self._quick_commands))
-        for i, (cmd, label) in enumerate(self._quick_commands):
-            settings.setArrayIndex(i)
-            settings.setValue("command", cmd)
-            settings.setValue("label", label)
-        settings.endArray()
-        settings.sync()
+        lay.addStretch()
 
     def _create_search_bar(self) -> QWidget:
-        """Create the search bar widget."""
         bar = QWidget()
-        bar.setStyleSheet("background-color: #2a2a2e;")
-        layout = QHBoxLayout()
-        layout.setContentsMargins(8, 4, 8, 4)
-        layout.setSpacing(6)
+        bar.setStyleSheet(_SEARCH_BAR_QSS)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 3, 8, 3)
+        lay.setSpacing(6)
 
-        layout.addWidget(QLabel("Find:"))
+        lay.addWidget(QLabel("Find:"))
 
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search terminal output...")
-        self.search_input.setMaximumWidth(300)
-        self.search_input.returnPressed.connect(self._search_next)
-        layout.addWidget(self.search_input)
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Search...")
+        self._search_input.setMaximumWidth(250)
+        self._search_input.returnPressed.connect(self._search_next)
+        lay.addWidget(self._search_input)
 
         prev_btn = QPushButton("Prev")
-        prev_btn.setMaximumHeight(24)
-        prev_btn.setStyleSheet(_TERM_BTN_STYLE)
+        prev_btn.setMaximumHeight(22)
+        prev_btn.setStyleSheet(_BTN_QSS)
         prev_btn.clicked.connect(self._search_prev)
-        layout.addWidget(prev_btn)
+        lay.addWidget(prev_btn)
 
         next_btn = QPushButton("Next")
-        next_btn.setMaximumHeight(24)
-        next_btn.setStyleSheet(_TERM_BTN_STYLE)
+        next_btn.setMaximumHeight(22)
+        next_btn.setStyleSheet(_BTN_QSS)
         next_btn.clicked.connect(self._search_next)
-        layout.addWidget(next_btn)
+        lay.addWidget(next_btn)
 
-        self.search_status = QLabel("")
-        layout.addWidget(self.search_status)
+        self._search_status = QLabel("")
+        lay.addWidget(self._search_status)
 
-        layout.addStretch()
+        lay.addStretch()
 
         close_btn = QPushButton("X")
-        close_btn.setMaximumWidth(24)
-        close_btn.setMaximumHeight(24)
-        close_btn.setStyleSheet(_TERM_BTN_STYLE)
+        close_btn.setMaximumWidth(22)
+        close_btn.setMaximumHeight(22)
+        close_btn.setStyleSheet(_BTN_QSS)
         close_btn.clicked.connect(self._close_search)
-        layout.addWidget(close_btn)
+        lay.addWidget(close_btn)
 
-        bar.setLayout(layout)
         return bar
 
-    def _get_monospace_font(self, size: int) -> QFont:
-        """Get monospace font with specified size."""
-        font = QFont()
-        for font_name in ['Menlo', 'Monaco', 'Courier New', 'Courier', 'monospace']:
-            font.setFamily(font_name)
-            if font.family().lower() != "system" or font_name == "monospace":
-                break
-        font.setPointSize(size)
-        font.setFixedPitch(True)
-        return font
+    @staticmethod
+    def _mono_font(size: int) -> QFont:
+        for family in ('Menlo', 'Consolas', 'DejaVu Sans Mono', 'Monospace'):
+            f = QFont(family, size)
+            if f.exactMatch():
+                return f
+        f = QFont()
+        f.setStyleHint(QFont.Monospace)
+        f.setPointSize(size)
+        return f
 
-    # ── Connection management ──
+    # ── External sync API (called by MainWindow) ──
 
-    def connect_terminal(self):
-        """Open SSH shell channel and start terminal."""
-        if not self.ssh_manager or not self.ssh_manager.is_connected():
-            QMessageBox.warning(
-                self, "Not Connected",
-                "Please establish an SSH connection first."
-            )
-            self._update_status("Not connected", "#ff6b6b")
+    def sync_connect(self, is_remote: bool, ssh_manager, profile):
+        """Called by MainWindow when the corresponding File Transfer pane connects.
+
+        Opens a terminal session: local PTY or a new SSH channel on the
+        same transport that the File Transfer pane uses.
+
+        Args:
+            is_remote: True for cluster, False for local
+            ssh_manager: The SSHManager from the File Transfer pane (None for local)
+            profile: The ConnectionProfile (None for local)
+        """
+        if getattr(self, '_shutdown_done', False):
             return
 
+        # If already connected, disconnect first
         if self._connected:
-            self.disconnect_terminal()
+            self._disconnect_terminal()
+            self.display.clear()
 
+        self.is_remote = is_remote
+        self.ssh_manager = ssh_manager
+        self.connected_profile = profile
+
+        # Update UI
+        if is_remote and profile:
+            self._status_label.setText(profile.name)
+            self._status_label.setStyleSheet(
+                "color: #a6da95; font-weight: bold; font-size: 11px; padding-right: 6px;")
+        else:
+            self._status_label.setText("Local")
+            self._status_label.setStyleSheet(
+                "color: #8aadf4; font-weight: bold; font-size: 11px; padding-right: 6px;")
+
+        self._quick_commands = self._load_quick_commands()
+        self._rebuild_quick_buttons()
+        self._stack.setCurrentIndex(1)
+        self._connect_terminal()
+
+    def sync_disconnect(self):
+        """Called by MainWindow when the corresponding File Transfer pane disconnects."""
+        if getattr(self, '_shutdown_done', False):
+            return
+
+        self._disconnect_terminal()
+        self.display.clear()
+        self.is_remote = False
+        self.ssh_manager = None
+        self.connected_profile = None
+        self._status_label.setText("")
+        self._stack.setCurrentIndex(0)
+
+    # ── Terminal connect / disconnect ──
+
+    def _connect_terminal(self):
+        if self._connected:
+            self._disconnect_terminal()
+        if self.is_remote:
+            self._connect_remote()
+        else:
+            self._connect_local()
+
+    def _connect_remote(self):
+        if not self.ssh_manager or not self.ssh_manager.is_connected():
+            return
         try:
             transport = self.ssh_manager._client.get_transport()
             if not transport or not transport.is_active():
-                raise Exception("No active SSH transport")
+                return
+            self._channel = transport.open_session()
+            self._channel.get_pty(term='xterm-256color', width=120, height=40)
+            self._channel.invoke_shell()
+            self._channel.settimeout(0.1)
 
-            self.channel = transport.open_session()
-            self.channel.get_pty(term='xterm-256color', width=120, height=40)
-            self.channel.invoke_shell()
-            self.channel.settimeout(0.1)
-
-            # Start the reader thread immediately — it will pick up
-            # the MOTD / login banner as soon as it arrives.
-            self.reader_thread = TerminalReaderThread(self.channel)
-            self.reader_thread.data_received.connect(
-                self._on_data_received, Qt.QueuedConnection)
-            self.reader_thread.error_occurred.connect(
-                self._on_reader_error, Qt.QueuedConnection)
-            self.reader_thread.channel_closed.connect(
-                self._on_channel_closed, Qt.QueuedConnection)
-            self.reader_thread.start()
+            self._reader = _RemoteReaderThread(self._channel)
+            self._reader.data_received.connect(self._on_data_received, Qt.QueuedConnection)
+            self._reader.closed.connect(self._on_closed, Qt.QueuedConnection)
+            self._reader.start()
 
             self._connected = True
-            self._update_status("Connected", "#00ff00")
-            self.terminal_display.setFocus()
+            self.display.setFocus()
 
-            # Auto-detect the remote stty erase character via a separate channel
-            self._detect_erase_char()
-            logger.info("Terminal connected to SSH channel")
+            # Auto-detect erase char
+            try:
+                stdout, _, ec = self.ssh_manager.execute_command(
+                    'stty -a 2>/dev/null | head -3', timeout=5)
+                if ec == 0 and stdout:
+                    m = re.search(r'erase\s*=\s*(\S+)', stdout)
+                    if m and m.group(1) == '^H':
+                        self._erase_char = b'\x08'
+            except Exception:
+                pass
 
         except Exception as e:
-            logger.error(f"Failed to connect terminal: {e}")
-            QMessageBox.critical(
-                self, "Connection Error",
-                f"Failed to open terminal: {str(e)}"
-            )
-            self._update_status(f"Error: {str(e)[:30]}", "#ff6b6b")
+            logger.error(f"Terminal remote connect failed: {e}")
 
-    def disconnect_terminal(self):
-        """Close terminal and cleanup.
-
-        Closes the channel BEFORE stopping the reader thread so the
-        blocking recv() unblocks immediately.  Disconnects signals first
-        to prevent queued data_received calls from arriving after the
-        widget is being destroyed (avoids QTextBlock/QTextCursor warnings).
-        """
-        if not self._connected and self.reader_thread is None and self.channel is None:
-            return  # Already disconnected — nothing to do
-        self._connected = False
+    def _connect_local(self):
         try:
-            # Disconnect signals first to avoid late-arriving queued calls
-            if self.reader_thread:
+            shell = os.environ.get('SHELL', '/bin/bash')
+            master_fd, slave_fd = pty.openpty()
+
+            try:
+                import fcntl
+                import termios
+                winsize = struct.pack('HHHH', 40, 120, 0, 0)
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+            except Exception:
+                pass
+
+            env = {**os.environ, 'TERM': 'xterm-256color'}
+            self._process = subprocess.Popen(
+                [shell, '-i', '-l'],
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                preexec_fn=os.setsid, env=env, close_fds=True,
+            )
+            os.close(slave_fd)
+            self._master_fd = master_fd
+
+            self._reader = _LocalReaderThread(master_fd)
+            self._reader.data_received.connect(self._on_data_received, Qt.QueuedConnection)
+            self._reader.closed.connect(self._on_closed, Qt.QueuedConnection)
+            self._reader.start()
+
+            self._connected = True
+            self.display.setFocus()
+        except Exception as e:
+            logger.error(f"Terminal local connect failed: {e}")
+
+    def _disconnect_terminal(self):
+        self._connected = False
+        if self.is_remote:
+            if self._channel:
                 try:
-                    self.reader_thread.data_received.disconnect()
-                    self.reader_thread.error_occurred.disconnect()
-                    self.reader_thread.channel_closed.disconnect()
-                except (TypeError, RuntimeError):
-                    pass
-            # Close channel to unblock the reader's recv()
-            if self.channel:
-                try:
-                    self.channel.close()
+                    self._channel.close()
                 except Exception:
                     pass
-                self.channel = None
-            # Now stop the reader — returns almost immediately
-            if self.reader_thread:
-                self.reader_thread.stop()
-                self.reader_thread = None
-            self._update_status("Disconnected", "#ffaa00")
-            logger.info("Terminal disconnected")
-        except Exception as e:
-            logger.error(f"Error disconnecting terminal: {e}")
+                self._channel = None
+            if self._reader:
+                try:
+                    self._reader.data_received.disconnect()
+                    self._reader.closed.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                self._reader.stop()
+                self._reader = None
+        else:
+            # Local: kill process → stop reader → close fd
+            if self._process:
+                try:
+                    os.killpg(os.getpgid(self._process.pid), _signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+                try:
+                    self._process.wait(timeout=0.3)
+                except Exception:
+                    pass
+                self._process = None
 
-    def _on_reconnect(self):
-        """Handle reconnect button click."""
-        self.disconnect_terminal()
-        self.connect_terminal()
+            if self._reader:
+                try:
+                    self._reader.data_received.disconnect()
+                    self._reader.closed.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                self._reader.stop()
+                self._reader = None
 
-    def _detect_erase_char(self):
-        """Query the interactive PTY's stty erase character.
+            if self._master_fd >= 0:
+                try:
+                    os.close(self._master_fd)
+                except OSError:
+                    pass
+                self._master_fd = -1
 
-        Sends 'stty -a' through the interactive channel but uses a
-        separate exec_command channel so nothing appears visually.
-        Note: exec_command runs in its own PTY which may have different
-        settings; the interactive PTY with term=xterm-256color almost
-        always uses ^? (\\x7f).  We keep \\x7f as default.
-        """
+    def _on_closed(self):
+        """Reader thread reports channel/fd closed."""
+        if not self._connected:
+            return
+        self._connected = False
+        # Auto-reconnect for remote if SSH still alive
+        if self.is_remote and self.ssh_manager and self.ssh_manager.is_connected():
+            self._status_label.setText("Reconnecting...")
+            QTimer.singleShot(500, self._connect_terminal)
+
+    # ── Data reception & VT100 ──
+
+    def _on_data_received(self, data: str):
         try:
-            stdout, stderr, exit_code = self.ssh_manager.execute_command(
-                'stty -a 2>/dev/null | head -3', timeout=5
-            )
-            if exit_code == 0 and stdout:
-                import re as _re
-                match = _re.search(r'erase\s*=\s*(\S+)', stdout)
-                if match:
-                    erase_val = match.group(1)
-                    if erase_val == '^H':
-                        self._erase_char = b'\x08'
-                    else:
-                        # ^? , <undef>, or anything else → use \x7f
-                        self._erase_char = b'\x7f'
-                    logger.info(f"Detected remote stty erase = {erase_val} "
-                                f"-> using {self._erase_char!r}")
-                else:
-                    logger.debug("Could not parse erase from stty output, "
-                                 f"keeping default \\x7f")
+            cursor = self.display.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            data = data.replace('\r\n', '\n')
+
+            pos = 0
+            buf = []
+
+            def _flush():
+                if not buf:
+                    return
+                text = ''.join(buf)
+                buf.clear()
+                block_remaining = cursor.block().length() - 1 - cursor.positionInBlock()
+                if block_remaining > 0:
+                    n = min(len(text), block_remaining)
+                    cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, n)
+                cursor.insertText(text, self._sgr_fmt)
+
+            for m in self._RE_TOKEN.finditer(data):
+                segment = data[pos:m.start()]
+                if segment:
+                    for ch in segment:
+                        self._handle_char(ch, cursor, buf, _flush)
+                pos = m.end()
+                _flush()
+
+                if m.group(1):
+                    self._handle_csi(m.group(2), m.group(3), cursor)
+
+            tail = data[pos:]
+            if tail:
+                for ch in tail:
+                    self._handle_char(ch, cursor, buf, _flush)
+            _flush()
+
+            self.display.setTextCursor(cursor)
+            self.display.ensureCursorVisible()
+
+            doc = self.display.document()
+            if doc.blockCount() > MAX_SCROLLBACK_LINES:
+                excess = doc.blockCount() - MAX_SCROLLBACK_LINES
+                tc = QTextCursor(doc)
+                # Select from start up to end of the excess-th line in one jump
+                tc.movePosition(QTextCursor.Start)
+                target_block = doc.findBlockByNumber(excess)
+                tc.setPosition(target_block.position(), QTextCursor.KeepAnchor)
+                tc.removeSelectedText()
+
         except Exception as e:
-            logger.debug(f"stty detection failed (keeping default \\x7f): {e}")
+            logger.error(f"Error processing terminal data: {e}")
+
+    @staticmethod
+    def _handle_char(ch, cursor, buf, flush_fn):
+        if ch == '\x08':
+            flush_fn()
+            if cursor.positionInBlock() > 0:
+                cursor.movePosition(QTextCursor.Left)
+        elif ch == '\r':
+            flush_fn()
+            cursor.movePosition(QTextCursor.StartOfBlock)
+        elif ch == '\n':
+            flush_fn()
+            if cursor.atEnd():
+                cursor.insertText('\n')
+            else:
+                cursor.movePosition(QTextCursor.Down)
+                cursor.movePosition(QTextCursor.StartOfBlock)
+        elif ch == '\x07':
+            pass
+        elif ch >= ' ' or ch == '\t':
+            buf.append(ch)
+
+    def _handle_csi(self, params_str, final, cursor):
+        params = []
+        if params_str:
+            for p in params_str.split(';'):
+                p = p.strip()
+                if p.isdigit():
+                    params.append(int(p))
+                elif p == '':
+                    params.append(0)
+                else:
+                    return
+        n = params[0] if params else None
+
+        if final == 'm':
+            self._handle_sgr(params or [0])
+        elif final == 'A':
+            cursor.movePosition(QTextCursor.Up, QTextCursor.MoveAnchor, max(n or 1, 1))
+        elif final == 'B':
+            cursor.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor, max(n or 1, 1))
+        elif final == 'C':
+            cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, max(n or 1, 1))
+        elif final == 'D':
+            cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor, max(n or 1, 1))
+        elif final == 'G':
+            col = max((n or 1) - 1, 0)
+            cursor.movePosition(QTextCursor.StartOfBlock)
+            line_len = cursor.block().length() - 1
+            if col > 0:
+                cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, min(col, line_len))
+        elif final in ('H', 'f'):
+            # Clamp to sane limits to prevent memory exhaustion
+            row = min(max((params[0] if len(params) > 0 else 1), 1), 500)
+            col = min(max((params[1] if len(params) > 1 else 1), 1), 500)
+            doc = cursor.document()
+            while doc.blockCount() < row:
+                cursor.movePosition(QTextCursor.End)
+                cursor.insertText('\n')
+            block = doc.findBlockByNumber(row - 1)
+            cursor.setPosition(block.position())
+            line_len = block.length() - 1
+            if col - 1 > line_len:
+                cursor.movePosition(QTextCursor.EndOfBlock)
+                cursor.insertText(' ' * (col - 1 - line_len))
+            else:
+                cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, col - 1)
+        elif final == 'K':
+            mode = n or 0
+            if mode == 0:
+                cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            elif mode == 1:
+                cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            elif mode == 2:
+                cursor.movePosition(QTextCursor.StartOfBlock)
+                cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+        elif final == 'J':
+            mode = n or 0
+            if mode == 0:
+                cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            elif mode == 1:
+                cursor.movePosition(QTextCursor.Start, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            elif mode == 2:
+                cursor.select(QTextCursor.Document)
+                cursor.removeSelectedText()
+        elif final == 'P':
+            count = max(n or 1, 1)
+            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, count)
+            cursor.removeSelectedText()
+        elif final == '@':
+            count = max(n or 1, 1)
+            cursor.insertText(' ' * count)
+            cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor, count)
+
+    def _handle_sgr(self, params):
+        fmt = self._sgr_fmt
+        i = 0
+        while i < len(params):
+            code = params[i]
+            if code == 0:
+                fmt.setForeground(self._sgr_default_fg)
+                fmt.setBackground(QColor(0, 0, 0, 0))
+                fmt.setFontWeight(QFont.Normal)
+                fmt.setFontItalic(False)
+                fmt.setFontUnderline(False)
+                self._sgr_bold = False
+            elif code == 1:
+                fmt.setFontWeight(QFont.Bold)
+                self._sgr_bold = True
+            elif code == 2:
+                fmt.setFontWeight(QFont.Light)
+                self._sgr_bold = False
+            elif code == 3:
+                fmt.setFontItalic(True)
+            elif code == 4:
+                fmt.setFontUnderline(True)
+            elif code == 7:
+                fg = fmt.foreground().color()
+                bg = fmt.background().color()
+                if bg.alpha() == 0:
+                    bg = self._sgr_default_bg
+                fmt.setForeground(bg)
+                fmt.setBackground(fg)
+            elif code == 22:
+                fmt.setFontWeight(QFont.Normal)
+                self._sgr_bold = False
+            elif code == 23:
+                fmt.setFontItalic(False)
+            elif code == 24:
+                fmt.setFontUnderline(False)
+            elif 30 <= code <= 37:
+                idx = code - 30
+                color = self._ANSI_BRIGHT[idx] if self._sgr_bold else self._ANSI_COLORS[idx]
+                fmt.setForeground(color)
+            elif code == 38:
+                color, skip = self._parse_extended_color(params, i)
+                if color:
+                    fmt.setForeground(color)
+                i += skip
+            elif code == 39:
+                fmt.setForeground(self._sgr_default_fg)
+            elif 40 <= code <= 47:
+                fmt.setBackground(self._ANSI_COLORS[code - 40])
+            elif code == 48:
+                color, skip = self._parse_extended_color(params, i)
+                if color:
+                    fmt.setBackground(color)
+                i += skip
+            elif code == 49:
+                fmt.setBackground(QColor(0, 0, 0, 0))
+            elif 90 <= code <= 97:
+                fmt.setForeground(self._ANSI_BRIGHT[code - 90])
+            elif 100 <= code <= 107:
+                fmt.setBackground(self._ANSI_BRIGHT[code - 100])
+            i += 1
+
+    @classmethod
+    def _parse_extended_color(cls, params, i):
+        if i + 1 >= len(params):
+            return None, 0
+        mode = params[i + 1]
+        if mode == 5 and i + 2 < len(params):
+            return cls._color_from_256(params[i + 2]), 2
+        if mode == 2 and i + 4 < len(params):
+            r = max(0, min(255, params[i + 2]))
+            g = max(0, min(255, params[i + 3]))
+            b = max(0, min(255, params[i + 4]))
+            return QColor(r, g, b), 4
+        return None, 0
+
+    @classmethod
+    def _color_from_256(cls, n):
+        if n < 0 or n > 255:
+            return QColor('#cccccc')
+        if n < 8:
+            return cls._ANSI_COLORS[n]
+        if n < 16:
+            return cls._ANSI_BRIGHT[n - 8]
+        if n < 232:
+            n -= 16
+            b = (n % 6) * 51
+            n //= 6
+            g = (n % 6) * 51
+            r = (n // 6) * 51
+            return QColor(r, g, b)
+        gray = 8 + (n - 232) * 10
+        return QColor(gray, gray, gray)
 
     # ── Key event handling ──
 
-    def eventFilter(self, obj, event):
-        """Intercept key presses on the terminal display.
-
-        macOS Qt modifier mapping:
-          Cmd key  → Qt.ControlModifier
-          Ctrl key → Qt.MetaModifier
-        So "Cmd+C" arrives as ControlModifier + Key_C.
-        We intercept Cmd+C/V for copy/paste BEFORE forwarding to the channel.
-        """
-        from PyQt5.QtCore import QEvent
-        if obj is self.terminal_display and event.type() == QEvent.KeyPress:
-            modifiers = event.modifiers()
-            key = event.key()
-
-            # On macOS: Cmd+C = ControlModifier+C, Ctrl+Shift+C = MetaModifier+Shift+C
-            # On Linux: Ctrl+Shift+C = ControlModifier+Shift+C
-
-            # Cmd+C / Ctrl+Shift+C → copy selection
-            if key == Qt.Key_C:
-                # Cmd+C (macOS) — Qt.ControlModifier WITHOUT Shift
-                if (modifiers & Qt.ControlModifier
-                        and not (modifiers & Qt.ShiftModifier)
-                        and not (modifiers & Qt.MetaModifier)):
-                    self._copy_selection()
-                    return True
-                # Ctrl+Shift+C (Linux) or physical Ctrl+Shift+C on macOS
-                if (modifiers & Qt.MetaModifier and modifiers & Qt.ShiftModifier):
-                    self._copy_selection()
-                    return True
-
-            # Cmd+V / Ctrl+Shift+V → paste clipboard
-            if key == Qt.Key_V:
-                # Cmd+V (macOS)
-                if (modifiers & Qt.ControlModifier
-                        and not (modifiers & Qt.ShiftModifier)
-                        and not (modifiers & Qt.MetaModifier)):
-                    self._paste_clipboard()
-                    return True
-                # Ctrl+Shift+V (Linux) or physical Ctrl+Shift+V on macOS
-                if (modifiers & Qt.MetaModifier and modifiers & Qt.ShiftModifier):
-                    self._paste_clipboard()
-                    return True
-
-            # Cmd+A / Ctrl+A → select all (don't send \x01 to shell)
-            if key == Qt.Key_A:
-                if (modifiers & Qt.ControlModifier
-                        and not (modifiers & Qt.ShiftModifier)
-                        and not (modifiers & Qt.MetaModifier)):
-                    self.terminal_display.selectAll()
-                    return True
-
-            # Cmd+F / Ctrl+F → toggle search
-            if key == Qt.Key_F:
-                if modifiers & (Qt.ControlModifier | Qt.MetaModifier):
-                    self._toggle_search()
-                    return True
-
-            # Escape → close search if visible
-            if key == Qt.Key_Escape and self._search_visible:
-                self._close_search()
-                return True
-
-            # Send key to channel if connected
-            if self._connected and self.channel:
-                self._send_key_to_channel(event)
-                return True
-
-            # Not connected — consume the event so nothing is typed locally
-            return True
-
-        return super().eventFilter(obj, event)
-
-    # Keymap for special keys — checked FIRST, before modifier logic,
-    # so backspace/arrows/etc. always work regardless of modifier state.
-    # (Inspired by korimas/PyQTerminal keymap approach.)
     _SPECIAL_KEYMAP = {
         Qt.Key_Return:    b'\r',
         Qt.Key_Enter:     b'\r',
@@ -741,18 +938,61 @@ class TerminalTab(QWidget):
         Qt.Key_Insert:    b'\x1b[2~',
     }
 
-    def _send_key_to_channel(self, event):
-        """Map Qt key event to terminal bytes and send to remote channel.
+    def eventFilter(self, obj, event):
+        if obj is self.display and event.type() == QEvent.KeyPress:
+            modifiers = event.modifiers()
+            key = event.key()
 
-        Uses a keymap-first approach: special keys (backspace, arrows, etc.)
-        are resolved before any modifier checks, ensuring they always work
-        regardless of spurious modifier flags (common on macOS).
+            # Cmd+C / Ctrl+Shift+C → copy
+            if key == Qt.Key_C:
+                if (modifiers & Qt.ControlModifier
+                        and not (modifiers & Qt.ShiftModifier)
+                        and not (modifiers & Qt.MetaModifier)):
+                    self._copy_selection()
+                    return True
+                if modifiers & Qt.MetaModifier and modifiers & Qt.ShiftModifier:
+                    self._copy_selection()
+                    return True
 
-        On macOS, Qt maps: Cmd → ControlModifier, Ctrl → MetaModifier.
-        Terminal control characters (Ctrl+C, Ctrl+D, etc.) are sent only
-        when the physical Ctrl key is pressed.
-        """
-        import sys
+            # Cmd+V / Ctrl+Shift+V → paste
+            if key == Qt.Key_V:
+                if (modifiers & Qt.ControlModifier
+                        and not (modifiers & Qt.ShiftModifier)
+                        and not (modifiers & Qt.MetaModifier)):
+                    self._paste_clipboard()
+                    return True
+                if modifiers & Qt.MetaModifier and modifiers & Qt.ShiftModifier:
+                    self._paste_clipboard()
+                    return True
+
+            # Cmd+A / Ctrl+A → select all
+            if key == Qt.Key_A:
+                if (modifiers & Qt.ControlModifier
+                        and not (modifiers & Qt.ShiftModifier)
+                        and not (modifiers & Qt.MetaModifier)):
+                    self.display.selectAll()
+                    return True
+
+            # Cmd+F / Ctrl+F → search
+            if key == Qt.Key_F:
+                if modifiers & (Qt.ControlModifier | Qt.MetaModifier):
+                    self._toggle_search()
+                    return True
+
+            # Escape → close search
+            if key == Qt.Key_Escape and self._search_visible:
+                self._close_search()
+                return True
+
+            # Send to terminal
+            if self._connected:
+                self._send_key(event)
+                return True
+            return True
+
+        return super().eventFilter(obj, event)
+
+    def _send_key(self, event):
         try:
             key = event.key()
             text = event.text()
@@ -764,16 +1004,10 @@ class TerminalTab(QWidget):
 
             data = None
 
-            # ── Step 1: Backspace (highest priority — must always work) ──
             if key == Qt.Key_Backspace:
                 data = self._erase_char
-                logger.debug(f"Backspace pressed, sending {data!r}")
-
-            # ── Step 2: Other special keys from keymap ──
             elif key in self._SPECIAL_KEYMAP:
                 data = self._SPECIAL_KEYMAP[key]
-
-            # ── Step 3: Ctrl+letter combos (physical Ctrl on macOS = MetaModifier) ──
             else:
                 if sys.platform == 'darwin':
                     is_ctrl = bool(modifiers & Qt.MetaModifier)
@@ -781,652 +1015,313 @@ class TerminalTab(QWidget):
                     is_ctrl = bool(modifiers & Qt.ControlModifier)
 
                 if is_ctrl and not (modifiers & Qt.AltModifier):
-                    if key == Qt.Key_C:
-                        data = b'\x03'
-                    elif key == Qt.Key_D:
-                        data = b'\x04'
-                    elif key == Qt.Key_L:
-                        data = b'\x0c'
-                    elif key == Qt.Key_Z:
-                        data = b'\x1a'
-                    elif key == Qt.Key_A:
-                        data = b'\x01'
-                    elif key == Qt.Key_E:
-                        data = b'\x05'
-                    elif key == Qt.Key_K:
-                        data = b'\x0b'
-                    elif key == Qt.Key_U:
-                        data = b'\x15'
-                    elif key == Qt.Key_W:
-                        data = b'\x17'
-                    elif key == Qt.Key_R:
-                        data = b'\x12'
-                    elif Qt.Key_A <= key <= Qt.Key_Z:
+                    ctrl_map = {
+                        Qt.Key_C: b'\x03', Qt.Key_D: b'\x04', Qt.Key_L: b'\x0c',
+                        Qt.Key_Z: b'\x1a', Qt.Key_A: b'\x01', Qt.Key_E: b'\x05',
+                        Qt.Key_K: b'\x0b', Qt.Key_U: b'\x15', Qt.Key_W: b'\x17',
+                        Qt.Key_R: b'\x12',
+                    }
+                    data = ctrl_map.get(key)
+                    if data is None and Qt.Key_A <= key <= Qt.Key_Z:
                         data = bytes([key - Qt.Key_A + 1])
 
-                # ── Step 4: Regular text input ──
                 if data is None and text and key != Qt.Key_Backspace:
                     data = text.encode('utf-8')
 
             if data:
-                logger.debug(f"Sending to channel: key=0x{key:04x} data={data!r}")
-                self.channel.sendall(data)
-
+                self._send_bytes(data)
         except Exception as e:
-            logger.error(f"Error sending key to terminal: {e}")
-            if "Socket is closed" in str(e) or "not open" in str(e):
-                self._connected = False
-                self._update_status("Disconnected", "#ff6b6b")
+            logger.error(f"Error sending key: {e}")
 
-    # ── Data reception & display ──
-
-    # ── ANSI color palettes ──
-    # Standard 8 colors (indices 0-7) — dark variants
-    _ANSI_COLORS = [
-        QColor('#2e3436'),  # 0 black
-        QColor('#cc0000'),  # 1 red
-        QColor('#4e9a06'),  # 2 green
-        QColor('#c4a000'),  # 3 yellow
-        QColor('#3465a4'),  # 4 blue
-        QColor('#75507b'),  # 5 magenta
-        QColor('#06989a'),  # 6 cyan
-        QColor('#d3d7cf'),  # 7 white
-    ]
-    # Bright variants (indices 8-15)
-    _ANSI_BRIGHT = [
-        QColor('#555753'),  # 8  bright black (grey)
-        QColor('#ef2929'),  # 9  bright red
-        QColor('#8ae234'),  # 10 bright green
-        QColor('#fce94f'),  # 11 bright yellow
-        QColor('#729fcf'),  # 12 bright blue
-        QColor('#ad7fa8'),  # 13 bright magenta
-        QColor('#34e2e2'),  # 14 bright cyan
-        QColor('#eeeeec'),  # 15 bright white
-    ]
-
-    # Regex that captures CSI sequences as separate tokens so they can be
-    # interpreted instead of blindly stripped.  Group 1 = parameter bytes,
-    # Group 2 = final byte (the command letter).
-    _RE_TOKEN = re.compile(
-        r'(\x1b\[([\x20-\x3f]*)([\x40-\x7e]))'  # CSI sequence
-        r'|(\x1b\][^\x07]{0,256}(?:\x07|\x1b\\))' # OSC sequence
-        r'|(\x1b[()][\x20-\x7e])'                  # charset designator
-        r'|(\x1b[^[\]()])'                          # other ESC single-char
-    )
-
-    def _on_data_received(self, data: str):
-        """Handle data from remote channel (runs on main thread).
-
-        Parses incoming VT100 data and translates control characters and
-        CSI cursor/erase sequences into QTextCursor operations so that
-        backspace, arrow-key editing, and line redraws display correctly.
-        """
+    def _send_bytes(self, data: bytes):
+        if not self._connected:
+            return
         try:
-            cursor = self.terminal_display.textCursor()
-            cursor.movePosition(QTextCursor.End)
-
-            # Normalise line endings
-            data = data.replace('\r\n', '\n')
-
-            # Tokenise: split around escape sequences so we can act on
-            # cursor-movement / erase CSI commands while discarding the rest.
-            pos = 0
-            buf = []  # buffer for plain printable text
-
-            def _flush():
-                """Insert buffered printable text at cursor with current SGR format."""
-                if not buf:
-                    return
-                text = ''.join(buf)
-                buf.clear()
-                # Overwrite mode: select len(text) chars ahead, then replace
-                block_remaining = (cursor.block().length() - 1
-                                   - cursor.positionInBlock())
-                if block_remaining > 0:
-                    n = min(len(text), block_remaining)
-                    cursor.movePosition(
-                        QTextCursor.Right, QTextCursor.KeepAnchor, n)
-                cursor.insertText(text, self._sgr_fmt)
-
-            for m in self._RE_TOKEN.finditer(data):
-                # Insert any plain text before this match
-                segment = data[pos:m.start()]
-                if segment:
-                    for ch in segment:
-                        self._handle_char(ch, cursor, buf, _flush)
-                pos = m.end()
-
-                # Flush before processing escape
-                _flush()
-
-                if m.group(1):
-                    # CSI sequence: \x1b[ <params> <final>
-                    params_str = m.group(2)
-                    final = m.group(3)
-                    self._handle_csi(params_str, final, cursor)
-                # else: OSC / charset / other ESC → discard (cosmetic only)
-
-            # Handle any remaining plain text after last escape
-            tail = data[pos:]
-            if tail:
-                for ch in tail:
-                    self._handle_char(ch, cursor, buf, _flush)
-            _flush()
-
-            self.terminal_display.setTextCursor(cursor)
-            self.terminal_display.ensureCursorVisible()
-
-            # Trim scrollback if it exceeds limit
-            doc = self.terminal_display.document()
-            if doc.blockCount() > MAX_SCROLLBACK_LINES:
-                excess = doc.blockCount() - MAX_SCROLLBACK_LINES
-                trim_cursor = QTextCursor(doc)
-                trim_cursor.movePosition(QTextCursor.Start)
-                for _ in range(excess):
-                    trim_cursor.movePosition(
-                        QTextCursor.Down, QTextCursor.KeepAnchor)
-                trim_cursor.movePosition(
-                    QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
-                trim_cursor.removeSelectedText()
-                trim_cursor.deleteChar()
-
+            if self.is_remote and self._channel:
+                self._channel.sendall(data)
+            elif not self.is_remote and self._master_fd >= 0:
+                os.write(self._master_fd, data)
+        except (OSError, EOFError):
+            pass  # Channel/fd closed during disconnect — ignore
         except Exception as e:
-            logger.error(f"Error processing terminal data: {e}")
-
-    @staticmethod
-    def _handle_char(ch, cursor, buf, flush_fn):
-        """Process a single non-escape character."""
-        if ch == '\x08':  # BS — move cursor left
-            flush_fn()
-            if cursor.positionInBlock() > 0:
-                cursor.movePosition(QTextCursor.Left)
-        elif ch == '\r':  # CR — move cursor to start of line
-            flush_fn()
-            cursor.movePosition(QTextCursor.StartOfBlock)
-        elif ch == '\n':  # LF — new line
-            flush_fn()
-            # If cursor is at the very end, insert a newline;
-            # otherwise move down one line.
-            if cursor.atEnd():
-                cursor.insertText('\n')
-            else:
-                cursor.movePosition(QTextCursor.Down)
-                cursor.movePosition(QTextCursor.StartOfBlock)
-        elif ch == '\x07':  # BEL — ignore
-            pass
-        elif ch >= ' ' or ch == '\t':
-            buf.append(ch)
-
-    def _handle_csi(self, params_str, final, cursor):
-        """Interpret a CSI escape sequence and apply to cursor.
-
-        Supports cursor movement (A/B/C/D/G), erase (K/J), delete/insert
-        (P/@), and SGR color/attribute sequences (m).
-        """
-        # Parse semicolon-separated numeric parameters
-        params = []
-        if params_str:
-            for p in params_str.split(';'):
-                p = p.strip()
-                if p.isdigit():
-                    params.append(int(p))
-                elif p == '':
-                    params.append(0)
-                else:
-                    # Private mode prefix like '?' — skip
-                    return
-
-        n = params[0] if params else None
-
-        if final == 'm':  # SGR — Select Graphic Rendition
-            self._handle_sgr(params or [0])
-        elif final == 'A':  # Cursor Up
-            cursor.movePosition(QTextCursor.Up, QTextCursor.MoveAnchor, max(n or 1, 1))
-        elif final == 'B':  # Cursor Down
-            cursor.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor, max(n or 1, 1))
-        elif final == 'C':  # Cursor Forward (right)
-            cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, max(n or 1, 1))
-        elif final == 'D':  # Cursor Backward (left)
-            cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor, max(n or 1, 1))
-        elif final == 'G':  # Cursor Horizontal Absolute
-            col = max((n or 1) - 1, 0)
-            cursor.movePosition(QTextCursor.StartOfBlock)
-            line_len = cursor.block().length() - 1
-            if col > 0:
-                cursor.movePosition(
-                    QTextCursor.Right, QTextCursor.MoveAnchor, min(col, line_len))
-        elif final in ('H', 'f'):  # Cursor Position  \x1b[row;colH
-            row = max((params[0] if len(params) > 0 else 1), 1)
-            col = max((params[1] if len(params) > 1 else 1), 1)
-            # Move cursor to absolute (row, col) in the document.
-            # Extend document with blank lines if needed.
-            doc = cursor.document()
-            while doc.blockCount() < row:
-                cursor.movePosition(QTextCursor.End)
-                cursor.insertText('\n')
-            block = doc.findBlockByNumber(row - 1)
-            cursor.setPosition(block.position())
-            # Extend line with spaces if needed
-            line_len = block.length() - 1
-            if col - 1 > line_len:
-                cursor.movePosition(QTextCursor.EndOfBlock)
-                cursor.insertText(' ' * (col - 1 - line_len))
-            else:
-                cursor.movePosition(
-                    QTextCursor.Right, QTextCursor.MoveAnchor, col - 1)
-        elif final == 'K':  # Erase in Line
-            mode = n or 0
-            if mode == 0:
-                cursor.movePosition(
-                    QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                cursor.removeSelectedText()
-            elif mode == 1:
-                cursor.movePosition(
-                    QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
-                cursor.removeSelectedText()
-            elif mode == 2:
-                cursor.movePosition(QTextCursor.StartOfBlock)
-                cursor.movePosition(
-                    QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                cursor.removeSelectedText()
-        elif final == 'J':  # Erase in Display
-            mode = n or 0
-            if mode == 0:  # Clear from cursor to end of screen
-                cursor.movePosition(
-                    QTextCursor.End, QTextCursor.KeepAnchor)
-                cursor.removeSelectedText()
-            elif mode == 1:  # Clear from start to cursor
-                pos = cursor.position()
-                cursor.movePosition(
-                    QTextCursor.Start, QTextCursor.KeepAnchor)
-                cursor.removeSelectedText()
-            elif mode == 2:  # Clear entire screen
-                cursor.select(QTextCursor.Document)
-                cursor.removeSelectedText()
-        elif final == 'P':  # Delete characters
-            count = max(n or 1, 1)
-            cursor.movePosition(
-                QTextCursor.Right, QTextCursor.KeepAnchor, count)
-            cursor.removeSelectedText()
-        elif final == '@':  # Insert blank characters
-            count = max(n or 1, 1)
-            cursor.insertText(' ' * count)
-            cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor, count)
-        # else: private modes (?h/?l), etc. — silently ignored
-
-    def _handle_sgr(self, params):
-        """Apply SGR (Select Graphic Rendition) parameters.
-
-        Updates self._sgr_fmt with the requested text attributes.
-        Supports:
-          0       — reset all
-          1       — bold
-          2       — dim
-          3       — italic
-          4       — underline
-          7       — inverse (swap fg/bg)
-          22      — normal intensity
-          23      — no italic
-          24      — no underline
-          27      — no inverse
-          30-37   — standard foreground colors
-          38;5;n  — 256-color foreground
-          38;2;r;g;b — 24-bit RGB foreground
-          39      — default foreground
-          40-47   — standard background colors
-          48;5;n  — 256-color background
-          48;2;r;g;b — 24-bit RGB background
-          49      — default background
-          90-97   — bright foreground colors
-          100-107 — bright background colors
-        """
-        fmt = self._sgr_fmt
-        i = 0
-        while i < len(params):
-            code = params[i]
-
-            if code == 0:  # Reset
-                fmt.setForeground(self._sgr_default_fg)
-                fmt.setBackground(QColor(0, 0, 0, 0))  # transparent
-                fmt.setFontWeight(QFont.Normal)
-                fmt.setFontItalic(False)
-                fmt.setFontUnderline(False)
-                self._sgr_bold = False
-            elif code == 1:  # Bold
-                fmt.setFontWeight(QFont.Bold)
-                self._sgr_bold = True
-            elif code == 2:  # Dim
-                fmt.setFontWeight(QFont.Light)
-                self._sgr_bold = False
-            elif code == 3:  # Italic
-                fmt.setFontItalic(True)
-            elif code == 4:  # Underline
-                fmt.setFontUnderline(True)
-            elif code == 7:  # Inverse
-                fg = fmt.foreground().color()
-                bg = fmt.background().color()
-                if bg.alpha() == 0:
-                    bg = self._sgr_default_bg
-                fmt.setForeground(bg)
-                fmt.setBackground(fg)
-            elif code == 22:  # Normal intensity
-                fmt.setFontWeight(QFont.Normal)
-                self._sgr_bold = False
-            elif code == 23:  # No italic
-                fmt.setFontItalic(False)
-            elif code == 24:  # No underline
-                fmt.setFontUnderline(False)
-            elif code == 27:  # No inverse (just reset to defaults)
-                pass  # hard to truly undo; ignore
-            elif 30 <= code <= 37:  # Standard foreground
-                idx = code - 30
-                color = (self._ANSI_BRIGHT[idx] if self._sgr_bold
-                         else self._ANSI_COLORS[idx])
-                fmt.setForeground(color)
-            elif code == 38:  # Extended foreground
-                color, skip = self._parse_extended_color(params, i)
-                if color:
-                    fmt.setForeground(color)
-                i += skip
-            elif code == 39:  # Default foreground
-                fmt.setForeground(self._sgr_default_fg)
-            elif 40 <= code <= 47:  # Standard background
-                fmt.setBackground(self._ANSI_COLORS[code - 40])
-            elif code == 48:  # Extended background
-                color, skip = self._parse_extended_color(params, i)
-                if color:
-                    fmt.setBackground(color)
-                i += skip
-            elif code == 49:  # Default background
-                fmt.setBackground(QColor(0, 0, 0, 0))
-            elif 90 <= code <= 97:  # Bright foreground
-                fmt.setForeground(self._ANSI_BRIGHT[code - 90])
-            elif 100 <= code <= 107:  # Bright background
-                fmt.setBackground(self._ANSI_BRIGHT[code - 100])
-
-            i += 1
-
-    @classmethod
-    def _parse_extended_color(cls, params, i):
-        """Parse 256-color (5;n) or 24-bit RGB (2;r;g;b) color sequences.
-
-        Args:
-            params: Full parameter list
-            i: Current index pointing at 38 or 48
-
-        Returns:
-            (QColor or None, number_of_extra_params_consumed)
-        """
-        if i + 1 >= len(params):
-            return None, 0
-
-        mode = params[i + 1]
-
-        if mode == 5 and i + 2 < len(params):
-            # 256-color: 38;5;n or 48;5;n
-            n = params[i + 2]
-            color = cls._color_from_256(n)
-            return color, 2
-
-        if mode == 2 and i + 4 < len(params):
-            # 24-bit RGB: 38;2;r;g;b or 48;2;r;g;b
-            r = max(0, min(255, params[i + 2]))
-            g = max(0, min(255, params[i + 3]))
-            b = max(0, min(255, params[i + 4]))
-            return QColor(r, g, b), 4
-
-        return None, 0
-
-    @classmethod
-    def _color_from_256(cls, n):
-        """Convert a 256-color index to QColor.
-
-        0-7:     standard colors
-        8-15:    bright colors
-        16-231:  6×6×6 color cube
-        232-255: grayscale ramp
-        """
-        if n < 0 or n > 255:
-            return QColor('#cccccc')
-        if n < 8:
-            return cls._ANSI_COLORS[n]
-        if n < 16:
-            return cls._ANSI_BRIGHT[n - 8]
-        if n < 232:
-            # 6×6×6 color cube
-            n -= 16
-            b = (n % 6) * 51
-            n //= 6
-            g = (n % 6) * 51
-            r = (n // 6) * 51
-            return QColor(r, g, b)
-        # Grayscale ramp: 232-255 → 8, 18, 28, ... 238
-        gray = 8 + (n - 232) * 10
-        return QColor(gray, gray, gray)
+            logger.error(f"Terminal send error: {e}")
 
     # ── Quick commands ──
 
     def _send_quick_command(self, command: str):
-        """Send a quick command string to the terminal.
-
-        Supports multi-line commands: each line is sent as a separate
-        command with a short delay between them so the shell can process
-        each one before the next arrives.
-        """
-        if not self._connected or not self.channel:
+        if not self._connected:
             return
         try:
             lines = command.split('\n')
             if len(lines) <= 1:
-                # Single-line: send immediately
-                self.channel.sendall((command + '\n').encode('utf-8'))
+                self._send_bytes((command + '\n').encode('utf-8'))
             else:
-                # Multi-line: send each line with a delay
                 for i, line in enumerate(lines):
                     line = line.rstrip()
                     if not line:
                         continue
                     if i == 0:
-                        self.channel.sendall((line + '\n').encode('utf-8'))
+                        self._send_bytes((line + '\n').encode('utf-8'))
                     else:
-                        # Use QTimer to stagger lines (~100ms apart)
                         QTimer.singleShot(
                             i * 100,
-                            lambda l=line: self._send_line(l)
+                            lambda l=line: self._send_bytes((l + '\n').encode('utf-8'))
                         )
-            self.terminal_display.setFocus()
+            self.display.setFocus()
         except Exception as e:
             logger.error(f"Error sending quick command: {e}")
 
-    def _send_line(self, line: str):
-        """Send a single line to the channel (used by multi-line quick commands)."""
-        if not self._connected or not self.channel:
-            return
-        try:
-            self.channel.sendall((line + '\n').encode('utf-8'))
-        except Exception as e:
-            logger.error(f"Error sending line: {e}")
+    def _show_quick_menu(self, pos, index, button):
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit")
+        remove_action = menu.addAction("Remove")
+        action = menu.exec_(button.mapToGlobal(pos))
+        if action == edit_action:
+            self._edit_quick_command(index)
+        elif action == remove_action:
+            self._remove_quick_command(index)
+
+    def _add_quick_command(self):
+        name, command = self._quick_cmd_dialog("Add Quick Command", "", "")
+        if name and command:
+            self._quick_commands.append((command, name))
+            self._save_quick_commands()
+            self._rebuild_quick_buttons()
+
+    def _edit_quick_command(self, index):
+        cmd, label = self._quick_commands[index]
+        new_name, new_cmd = self._quick_cmd_dialog("Edit Quick Command", label, cmd)
+        if new_name and new_cmd:
+            self._quick_commands[index] = (new_cmd, new_name)
+            self._save_quick_commands()
+            self._rebuild_quick_buttons()
+
+    def _remove_quick_command(self, index):
+        cmd, label = self._quick_commands[index]
+        reply = QMessageBox.question(
+            self, "Remove Quick Command", f'Remove "{label}"?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._quick_commands.pop(index)
+            self._save_quick_commands()
+            self._rebuild_quick_buttons()
+
+    def _quick_cmd_dialog(self, title, name, command):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setMinimumWidth(420)
+        dialog.setMinimumHeight(240)
+
+        layout = QVBoxLayout()
+
+        name_lay = QHBoxLayout()
+        name_lay.addWidget(QLabel("Name:"))
+        name_input = QLineEdit(name)
+        name_input.setPlaceholderText("e.g. My Jobs")
+        name_lay.addWidget(name_input)
+        layout.addLayout(name_lay)
+
+        layout.addWidget(QLabel("Command:"))
+        from PyQt5.QtWidgets import QPlainTextEdit as _PTE
+        cmd_input = _PTE()
+        cmd_input.setPlaceholderText("e.g. squeue -u $USER")
+        cmd_input.setFont(self._mono_font(11))
+        cmd_input.setStyleSheet("""
+            QPlainTextEdit {
+                background: #1e2030; color: #cad3f5;
+                border: 1px solid #363a4f; border-radius: 4px; padding: 6px;
+            }
+        """)
+        cmd_input.setPlainText(command)
+        layout.addWidget(cmd_input)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        dialog.setLayout(layout)
+        if dialog.exec_() == QDialog.Accepted:
+            n = name_input.text().strip()
+            c = cmd_input.toPlainText().strip()
+            if n and c:
+                return n, c
+        return None, None
+
+    def _qsettings_key(self):
+        kind = "remote" if self.is_remote else "local"
+        return f"TermPaneQuickCmds_{self._side}_{kind}"
+
+    def _load_quick_commands(self):
+        settings = QSettings("TransfPro", "TransfPro")
+        key = self._qsettings_key()
+        count = settings.beginReadArray(key)
+        if count == 0:
+            settings.endArray()
+            return list(self._DEFAULT_REMOTE_COMMANDS if self.is_remote
+                        else self._DEFAULT_LOCAL_COMMANDS)
+        commands = []
+        for i in range(count):
+            settings.setArrayIndex(i)
+            cmd = settings.value("command", "")
+            label = settings.value("label", "")
+            if cmd and label:
+                commands.append((cmd, label))
+        settings.endArray()
+        return commands if commands else list(
+            self._DEFAULT_REMOTE_COMMANDS if self.is_remote
+            else self._DEFAULT_LOCAL_COMMANDS)
+
+    def _save_quick_commands(self):
+        settings = QSettings("TransfPro", "TransfPro")
+        key = self._qsettings_key()
+        settings.beginWriteArray(key, len(self._quick_commands))
+        for i, (cmd, label) in enumerate(self._quick_commands):
+            settings.setArrayIndex(i)
+            settings.setValue("command", cmd)
+            settings.setValue("label", label)
+        settings.endArray()
+        settings.sync()
 
     # ── Search ──
 
     def _toggle_search(self):
-        """Toggle search bar visibility."""
         self._search_visible = not self._search_visible
-        self.search_bar.setVisible(self._search_visible)
+        self._search_bar.setVisible(self._search_visible)
         if self._search_visible:
-            self.search_input.setFocus()
-            self.search_input.selectAll()
+            self._search_input.setFocus()
+            self._search_input.selectAll()
         else:
             self._clear_search_highlights()
-            self.terminal_display.setFocus()
+            self.display.setFocus()
 
     def _close_search(self):
-        """Close the search bar."""
         self._search_visible = False
-        self.search_bar.setVisible(False)
+        self._search_bar.hide()
         self._clear_search_highlights()
-        self.terminal_display.setFocus()
+        self.display.setFocus()
 
     def _search_next(self):
-        """Find next occurrence of search text."""
-        text = self.search_input.text()
+        text = self._search_input.text()
         if not text:
             return
-        found = self.terminal_display.find(text)
+        found = self.display.find(text)
         if not found:
-            # Wrap around to top
-            cursor = self.terminal_display.textCursor()
+            cursor = self.display.textCursor()
             cursor.movePosition(QTextCursor.Start)
-            self.terminal_display.setTextCursor(cursor)
-            found = self.terminal_display.find(text)
-        self.search_status.setText("" if found else "Not found")
+            self.display.setTextCursor(cursor)
+            found = self.display.find(text)
+        self._search_status.setText("" if found else "Not found")
 
     def _search_prev(self):
-        """Find previous occurrence of search text."""
-        text = self.search_input.text()
+        text = self._search_input.text()
         if not text:
             return
-        found = self.terminal_display.find(text, QTextDocument.FindBackward)
+        found = self.display.find(text, QTextDocument.FindBackward)
         if not found:
-            cursor = self.terminal_display.textCursor()
+            cursor = self.display.textCursor()
             cursor.movePosition(QTextCursor.End)
-            self.terminal_display.setTextCursor(cursor)
-            found = self.terminal_display.find(text, QTextDocument.FindBackward)
-        self.search_status.setText("" if found else "Not found")
+            self.display.setTextCursor(cursor)
+            found = self.display.find(text, QTextDocument.FindBackward)
+        self._search_status.setText("" if found else "Not found")
 
     def _clear_search_highlights(self):
-        """Clear any search selection."""
-        cursor = self.terminal_display.textCursor()
+        cursor = self.display.textCursor()
         cursor.clearSelection()
-        self.terminal_display.setTextCursor(cursor)
-        self.search_status.setText("")
+        self.display.setTextCursor(cursor)
+        self._search_status.setText("")
 
-    # ── Copy, Paste & context menu ──
+    # ── Copy / Paste / Context menu ──
 
     def _copy_selection(self):
-        """Copy selected text to clipboard."""
-        cursor = self.terminal_display.textCursor()
+        cursor = self.display.textCursor()
         if cursor.hasSelection():
             QApplication.clipboard().setText(cursor.selectedText())
 
     def _paste_clipboard(self):
-        """Paste clipboard text into the terminal (send to SSH channel)."""
-        if not self._connected or not self.channel:
+        if not self._connected:
             return
         text = QApplication.clipboard().text()
         if text:
-            try:
-                # Send clipboard content as typed input to the remote shell
-                self.channel.sendall(text.encode('utf-8'))
-            except Exception as e:
-                logger.error(f"Paste failed: {e}")
+            self._send_bytes(text.encode('utf-8'))
 
     def _show_context_menu(self, pos):
-        """Show right-click context menu."""
         menu = QMenu(self)
-
-        copy_action = menu.addAction("Copy")
-        copy_action.setShortcut("Ctrl+Shift+C")
-        copy_action.triggered.connect(self._copy_selection)
-
-        paste_action = menu.addAction("Paste")
-        paste_action.setShortcut("Ctrl+Shift+V")
-        paste_action.triggered.connect(self._paste_clipboard)
-
-        select_all_action = menu.addAction("Select All")
-        select_all_action.triggered.connect(self.terminal_display.selectAll)
-
+        menu.addAction("Copy", self._copy_selection, "Ctrl+Shift+C")
+        menu.addAction("Paste", self._paste_clipboard, "Ctrl+Shift+V")
+        menu.addAction("Select All", self.display.selectAll)
         menu.addSeparator()
+        menu.addAction("Clear Screen", lambda: self.display.clear())
+        menu.exec_(self.display.mapToGlobal(pos))
 
-        clear_action = menu.addAction("Clear Screen")
-        clear_action.triggered.connect(self._on_clear_terminal)
+    # ── Font size ──
 
-        menu.addSeparator()
+    def _font_increase(self):
+        self._base_font_size = min(self._base_font_size + 1, 24)
+        self.display.setFont(self._mono_font(self._base_font_size))
 
-        reconnect_action = menu.addAction("Reconnect")
-        reconnect_action.triggered.connect(self._on_reconnect)
+    def _font_decrease(self):
+        self._base_font_size = max(self._base_font_size - 1, 7)
+        self.display.setFont(self._mono_font(self._base_font_size))
 
-        menu.exec_(self.terminal_display.mapToGlobal(pos))
+    # ── Cleanup ──
 
-    # ── Toolbar signal buttons ──
+    def cleanup(self):
+        self._disconnect_terminal()
 
-    def _send_ctrl_c(self):
-        if self._connected and self.channel:
-            try:
-                self.channel.sendall(b'\x03')
-            except Exception as e:
-                logger.error(f"Failed to send Ctrl+C: {e}")
 
-    def _send_ctrl_d(self):
-        if self._connected and self.channel:
-            try:
-                self.channel.sendall(b'\x04')
-            except Exception as e:
-                logger.error(f"Failed to send Ctrl+D: {e}")
+# ── TerminalTab (dual-pane container) ───────────────────────────────
 
-    def _on_clear_terminal(self):
-        self.terminal_display.clear()
+class TerminalTab(QWidget):
+    """Dual-pane terminal tab — connections are synced from File Transfer."""
 
-    # ── Channel event handlers ──
+    connection_lost = pyqtSignal()
 
-    def _on_reader_error(self, error_msg: str):
-        logger.error(f"Terminal reader error: {error_msg}")
-        self._update_status(f"Error: {error_msg[:30]}", "#ff6b6b")
-        self._connected = False
+    def __init__(self, database: Database, parent=None):
+        super().__init__(parent)
+        self.database = database
 
-    def _on_channel_closed(self):
-        self._connected = False
-        logger.info("Terminal channel closed")
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Skip auto-reconnect during application shutdown
-        if getattr(self, '_shutdown_done', False):
-            return
+        splitter = QSplitter(Qt.Horizontal)
 
-        # Auto-reconnect if SSH transport is still alive (max 3 rapid retries)
-        if not hasattr(self, '_reconnect_count'):
-            self._reconnect_count = 0
-            self._last_reconnect_time = 0
+        self.left_pane = TerminalPane("left", parent=self)
+        self.right_pane = TerminalPane("right", parent=self)
 
-        import time as _time
-        now = _time.time()
-        # Reset counter if last reconnect was more than 30 seconds ago
-        if now - self._last_reconnect_time > 30:
-            self._reconnect_count = 0
+        splitter.addWidget(self.left_pane)
+        splitter.addWidget(self.right_pane)
+        splitter.setSizes([500, 500])
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
 
-        if (self.ssh_manager and self.ssh_manager.is_connected()
-                and self._reconnect_count < 3):
-            self._reconnect_count += 1
-            self._last_reconnect_time = now
-            logger.info(f"SSH still active — auto-reconnecting terminal "
-                        f"(attempt {self._reconnect_count}/3)")
-            self._update_status("Reconnecting...", "#ffaa00")
-            QTimer.singleShot(500, self.connect_terminal)
-        else:
-            if self._reconnect_count >= 3:
-                logger.warning("Max reconnect attempts reached")
-            self._update_status("Channel closed", "#ffaa00")
-            self._reconnect_count = 0
-            self.connection_lost.emit()
+        layout.addWidget(splitter)
+        self.setLayout(layout)
 
-    def _on_connection_status_changed(self, connected: bool):
-        if getattr(self, '_shutdown_done', False):
-            return
-        if not connected:
-            self.disconnect_terminal()
-        else:
-            self.connect_terminal()
+    # ── Sync API (called by MainWindow) ──
 
-    def _update_status(self, message: str, color: str):
-        self.status_label.setText(message)
-        self.status_label.setStyleSheet(
-            f"color: {color}; font-weight: bold; font-size: 12px; "
-            f"padding-right: 12px; margin-right: 8px;"
-        )
+    def sync_connect(self, side: str, is_remote: bool, ssh_manager, profile):
+        """Connect the left or right terminal pane."""
+        pane = self.left_pane if side == "left" else self.right_pane
+        pane.sync_connect(is_remote, ssh_manager, profile)
 
-    def closeEvent(self, event):
-        """Ensure reader thread is stopped before widget destruction."""
-        if getattr(self, '_shutdown_done', False):
-            super().closeEvent(event)
-            return
-        self.disconnect_terminal()
-        super().closeEvent(event)
+    def sync_disconnect(self, side: str):
+        """Disconnect the left or right terminal pane."""
+        pane = self.left_pane if side == "left" else self.right_pane
+        pane.sync_disconnect()
+
+    # ── Legacy compatibility ──
+
+    def connect_terminal(self):
+        """No-op — connections are driven by File Transfer sync."""
+        pass
+
+    def disconnect_terminal(self):
+        """Disconnect both panes."""
+        self.left_pane._disconnect_terminal()
+        self.right_pane._disconnect_terminal()
+
+    def cleanup(self):
+        self.left_pane.cleanup()
+        self.right_pane.cleanup()

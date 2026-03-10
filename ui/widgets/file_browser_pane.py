@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QTreeWidget,
     QTreeWidgetItem, QHeaderView, QMenu, QMessageBox, QInputDialog,
     QFileDialog, QLabel, QCheckBox, QComboBox, QFrame, QSplitter,
-    QApplication, QFileIconProvider
+    QApplication, QFileIconProvider, QStackedWidget
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QMimeData, QUrl, QTimer, QSize, QThread, QSettings, QEvent
 from PyQt5.QtGui import QIcon, QDrag, QFont, QColor, QPixmap, QPainter, QPen
@@ -146,16 +146,22 @@ class FileBrowserPane(QWidget):
     transfer_button_clicked = pyqtSignal()  # Upload or Download button pressed
     open_remote_file_requested = pyqtSignal(str)  # remote path to download & open
     open_remote_with_requested = pyqtSignal(str, str)  # remote path, app path
-    # Quick Transfer Macro: emits (local_path, remote_path, direction)
-    transfer_macro_requested = pyqtSignal(str, str, str)
+    # Quick Transfer Macro: emits (file_names_list,)
+    transfer_macro_requested = pyqtSignal(list)
 
     # Sorting data roles
     SORT_ROLE = Qt.UserRole + 1
     IS_DIR_ROLE = Qt.UserRole + 2
 
+    # Signal emitted when pane activates (local or cluster connected)
+    pane_activated = pyqtSignal(bool)  # True if remote/cluster, False if local
+    # Signal emitted when user goes back to the connection selector
+    pane_deactivated = pyqtSignal()
+
     def __init__(
         self,
         title: str,
+        database=None,
         is_remote: bool = False,
         sftp_manager=None,
         parent=None
@@ -164,15 +170,19 @@ class FileBrowserPane(QWidget):
         Initialize the file browser pane.
 
         Args:
-            title: Title for this pane ("Local" or "Remote")
-            is_remote: Whether this is a remote browser
-            sftp_manager: SFTPManager instance for remote operations
+            title: Title for this pane (e.g. "Left" or "Right")
+            database: Database instance for loading connection profiles
+            is_remote: Whether this is a remote browser (legacy, now set dynamically)
+            sftp_manager: SFTPManager instance for remote operations (legacy)
             parent: Parent widget
         """
         super().__init__(parent)
         self.title = title
+        self.database = database
         self.is_remote = is_remote
         self.sftp_manager = sftp_manager
+        self.ssh_manager = None  # Set when cluster connected
+        self.connected_profile = None  # Set when cluster connected
         self.current_path = os.path.expanduser("~") if not is_remote else "."
         self.show_hidden = False
         self.bookmarks = {}
@@ -193,7 +203,7 @@ class FileBrowserPane(QWidget):
         self._load_bookmarks()
 
         # Quick Transfer Macros
-        self._transfer_macros = []  # list of {name, local_path, remote_path, direction}
+        self._transfer_macros = []  # list of {name, files}
         self._load_transfer_macros()
 
         # File filter
@@ -210,17 +220,34 @@ class FileBrowserPane(QWidget):
 
         self._setup_ui()
         self._connect_signals()
-        # Only auto-refresh local pane; remote pane refreshes after connection
-        if not self.is_remote:
-            self.refresh()
+        # Don't auto-refresh — wait for user to select Local or Cluster
 
     def _setup_ui(self):
         """Set up the UI with macOS Finder-inspired design."""
+        outer_layout = QVBoxLayout()
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # ── STACKED WIDGET: page 0 = selector, page 1 = browser ──
+        self._stack = QStackedWidget()
+
+        # Page 0: Connection Selector
+        from transfpro.ui.widgets.connection_selector import ConnectionSelector
+        self._connection_selector = ConnectionSelector(
+            database=self.database, parent=self
+        )
+        self._connection_selector.local_selected.connect(self._on_local_selected)
+        self._connection_selector.cluster_connected.connect(self._on_cluster_connected)
+        self._connection_selector.profiles_changed.connect(self._on_profiles_changed)
+        self._stack.addWidget(self._connection_selector)
+
+        # Page 1: File browser (built below)
+        self._browser_page = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── TITLE BAR (Finder-style window header with transfer button) ──
+        # ── TITLE BAR (Finder-style window header with transfer + disconnect) ──
         title_bar = QWidget()
         title_bar.setFixedHeight(32)
         title_bar.setStyleSheet("""
@@ -253,39 +280,61 @@ class FileBrowserPane(QWidget):
             }
         """
 
+        disconnect_btn_qss = """
+            QPushButton {
+                background: rgba(237, 135, 150, 0.12);
+                border: 1px solid rgba(237, 135, 150, 0.25);
+                border-radius: 6px;
+                color: #ed8796;
+                padding: 2px 8px;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: rgba(237, 135, 150, 0.25);
+                border-color: rgba(237, 135, 150, 0.5);
+                color: white;
+            }
+        """
+
         title_label_qss = """
             color: #cad3f5; font-size: 12px;
             font-weight: 600; letter-spacing: 0.3px;
         """
 
-        if not self.is_remote:
-            # Local pane: title centered, Upload button on right edge
-            title_layout.addStretch()
-            title_label = QLabel(self.title)
-            title_label.setStyleSheet(title_label_qss)
-            title_layout.addWidget(title_label)
-            title_layout.addStretch()
+        # Determine which side this pane is on for button placement
+        is_left = (self.title == "Left")
 
-            self.transfer_button = QPushButton("↑ Upload")
-            self.transfer_button.setFixedHeight(22)
-            self.transfer_button.setStyleSheet(transfer_btn_qss)
-            self.transfer_button.setToolTip("Upload selected files to remote")
-            self.transfer_button.clicked.connect(self.transfer_button_clicked.emit)
+        # Build widgets
+        self._disconnect_button = QPushButton("Exit")
+        self._disconnect_button.setFixedHeight(22)
+        self._disconnect_button.setStyleSheet(disconnect_btn_qss)
+        self._disconnect_button.setToolTip("Disconnect and go back to selector")
+        self._disconnect_button.clicked.connect(self._on_disconnect_clicked)
+
+        self._title_label = QLabel(self.title)
+        self._title_label.setStyleSheet(title_label_qss)
+
+        self.transfer_button = QPushButton("Transfer →" if is_left else "← Transfer")
+        self.transfer_button.setFixedHeight(22)
+        self.transfer_button.setStyleSheet(transfer_btn_qss)
+        self.transfer_button.setToolTip("Transfer selected files to the other pane")
+        self.transfer_button.clicked.connect(self.transfer_button_clicked.emit)
+
+        if is_left:
+            # Left pane:  [Exit]  name  [Transfer →]
+            title_layout.addWidget(self._disconnect_button)
+            title_layout.addStretch()
+            title_layout.addWidget(self._title_label)
+            title_layout.addStretch()
             title_layout.addWidget(self.transfer_button)
         else:
-            # Remote pane: Download button on left edge, title centered
-            self.transfer_button = QPushButton("↓ Download")
-            self.transfer_button.setFixedHeight(22)
-            self.transfer_button.setStyleSheet(transfer_btn_qss)
-            self.transfer_button.setToolTip("Download selected files to local")
-            self.transfer_button.clicked.connect(self.transfer_button_clicked.emit)
+            # Right pane: [← Transfer]  name  [Exit]
             title_layout.addWidget(self.transfer_button)
-
             title_layout.addStretch()
-            title_label = QLabel(self.title)
-            title_label.setStyleSheet(title_label_qss)
-            title_layout.addWidget(title_label)
+            title_layout.addWidget(self._title_label)
             title_layout.addStretch()
+            title_layout.addWidget(self._disconnect_button)
 
         layout.addWidget(title_bar)
 
@@ -581,7 +630,14 @@ class FileBrowserPane(QWidget):
 
         layout.addWidget(status_bar)
 
-        self.setLayout(layout)
+        self._browser_page.setLayout(layout)
+        self._stack.addWidget(self._browser_page)
+
+        # Start on selector page (page 0)
+        self._stack.setCurrentIndex(0)
+
+        outer_layout.addWidget(self._stack)
+        self.setLayout(outer_layout)
 
     def _connect_signals(self):
         """Connect signals and slots."""
@@ -609,6 +665,78 @@ class FileBrowserPane(QWidget):
         copy_sc.activated.connect(self._on_copy_files)
         paste_sc = QShortcut(QKeySequence.Paste, self)
         paste_sc.activated.connect(self._on_paste_files)
+
+    # ── Connection selector handlers ──
+
+    def _on_local_selected(self):
+        """User chose 'Local' — switch to file browser in local mode."""
+        self.is_remote = False
+        self.sftp_manager = None
+        self.ssh_manager = None
+        self.connected_profile = None
+        self.current_path = os.path.expanduser("~")
+        self._title_label.setText("Local")
+        # Reload per-connection bookmarks & macros
+        self._load_bookmarks()
+        self._rebuild_bookmark_buttons()
+        self._load_transfer_macros()
+        self._rebuild_macro_buttons()
+        self._stack.setCurrentIndex(1)
+        self.refresh()
+        self.pane_activated.emit(False)
+
+    def _on_cluster_connected(self, ssh_mgr, sftp_mgr, profile):
+        """User connected to a cluster — switch to file browser in remote mode."""
+        self.is_remote = True
+        self.ssh_manager = ssh_mgr
+        self.sftp_manager = sftp_mgr
+        self.connected_profile = profile
+        self.current_path = "."
+        self._title_label.setText(profile.name)
+        # Reload per-connection bookmarks & macros
+        self._load_bookmarks()
+        self._rebuild_bookmark_buttons()
+        self._load_transfer_macros()
+        self._rebuild_macro_buttons()
+        self._stack.setCurrentIndex(1)
+        self.refresh()
+        self.pane_activated.emit(True)
+
+    def _on_profiles_changed(self):
+        """Profiles were added/edited/deleted in this selector — notify parent."""
+        # Parent (FileTransferTab) will tell the other pane to reload profiles
+        pass
+
+    def _on_disconnect_clicked(self):
+        """Disconnect (if cluster) and go back to the connection selector."""
+        # Emit pane_deactivated FIRST so the mini-terminal gets disconnected
+        # before we tear down the SSH connection underneath it.
+        self.pane_deactivated.emit()
+
+        # Clean up remote state
+        if self.is_remote and self._connection_selector:
+            self._connection_selector.disconnect_current()
+
+        # Also stop any pending browser worker
+        if self._browser_thread is not None and self._browser_thread.isRunning():
+            self._browser_thread.quit()
+            self._browser_thread.wait(300)
+
+        # Clear the file tree
+        self.file_tree.clear()
+        self.is_remote = False
+        self.sftp_manager = None
+        self.ssh_manager = None
+        self.connected_profile = None
+        self.current_path = "."
+        # Reload profiles in case the other pane changed them
+        self._connection_selector.reload_profiles()
+        # Switch back to selector
+        self._stack.setCurrentIndex(0)
+
+    def get_connection_selector(self):
+        """Return the embedded ConnectionSelector widget."""
+        return self._connection_selector
 
     # ── Thread lifecycle ──
 
@@ -680,6 +808,11 @@ class FileBrowserPane(QWidget):
 
     def _on_listing_ready(self, path: str, metadata_list: list):
         """Handle directory listing result from background worker."""
+        # Ignore stale results if user has already navigated elsewhere
+        if (hasattr(self, '_pending_path') and self._pending_path
+                and path != self._pending_path):
+            return
+        self._pending_path = None
         try:
             self.current_path = path
             self.path_input.setText(path)
@@ -942,7 +1075,8 @@ class FileBrowserPane(QWidget):
         """Navigate to directory and refresh listing."""
         try:
             if self.is_remote:
-                # For remote, use async listing — _on_listing_ready will update UI
+                # Track which path we expect, so stale results are ignored
+                self._pending_path = path
                 self._run_remote_op('list_dir', path=path)
                 return
             else:
@@ -1422,20 +1556,8 @@ class FileBrowserPane(QWidget):
                     # External (local) → Remote = upload
                     self.transfer_upload_requested.emit(local_paths, target_dir)
                 else:
-                    # External (local) → Local = local file copy
-                    import shutil
-                    for src in local_paths:
-                        dst = os.path.join(target_dir, os.path.basename(src))
-                        if os.path.abspath(src) == os.path.abspath(dst):
-                            continue
-                        try:
-                            if os.path.isdir(src):
-                                shutil.copytree(src, dst)
-                            else:
-                                shutil.copy2(src, dst)
-                        except Exception as e:
-                            logger.error(f"Local copy from external drop: {e}")
-                    self.refresh()
+                    # External (local) → Local = local file copy (background)
+                    self._async_local_copy(local_paths, target_dir)
                 event.acceptProposedAction()
             else:
                 event.ignore()
@@ -1679,13 +1801,7 @@ class FileBrowserPane(QWidget):
                     self._pending_delete_count = 1
                     self._run_remote_op('delete', path=path, is_dir=is_dir)
                 else:
-                    if is_dir:
-                        import shutil
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                    self._clear_busy()
-                    self.refresh()
+                    self._async_local_delete([(path, is_dir)])
             except Exception as e:
                 self._clear_busy()
                 QMessageBox.critical(self, "Error", str(e))
@@ -1717,6 +1833,7 @@ class FileBrowserPane(QWidget):
             self._show_busy(f"Deleting {len(names)} items...")
             try:
                 delete_count = 0
+                local_deletes = []
                 for item in items:
                     path = item.data(0, Qt.UserRole)
                     is_dir = item.data(0, self.IS_DIR_ROLE)
@@ -1726,17 +1843,14 @@ class FileBrowserPane(QWidget):
                         self._run_remote_op('delete', path=path, is_dir=is_dir)
                         delete_count += 1
                     else:
-                        if is_dir:
-                            import shutil
-                            shutil.rmtree(path)
-                        else:
-                            os.remove(path)
+                        local_deletes.append((path, is_dir))
                 if self.is_remote:
                     # Track how many remote deletes are pending
                     self._pending_delete_count = delete_count
+                elif local_deletes:
+                    self._async_local_delete(local_deletes)
                 else:
                     self._clear_busy()
-                    self.refresh()
             except Exception as e:
                 self._clear_busy()
                 QMessageBox.critical(self, "Error", str(e))
@@ -1818,26 +1932,127 @@ class FileBrowserPane(QWidget):
         logger.info(f"Copied to clipboard: {path}")
 
     def _on_properties(self, path: str):
-        """Handle properties dialog."""
+        """Handle properties dialog (non-blocking)."""
         try:
             if self.is_remote:
                 # Async: _on_file_info_ready will show dialog
                 self._run_remote_op('info', path=path)
             else:
-                stat = os.stat(path)
-                is_dir = os.path.isdir(path)
-                info_text = (
-                    f"Name: {os.path.basename(path)}\n"
-                    f"Path: {path}\n"
-                    f"Size: {self._format_size(stat.st_size) if not is_dir else '—'}\n"
-                    f"Modified: {datetime.fromtimestamp(stat.st_mtime)}\n"
-                    f"Permissions: {oct(stat.st_mode)[-3:]}\n"
-                    f"Type: {'Directory' if is_dir else 'File'}"
-                )
-                QMessageBox.information(self, "Properties", info_text)
+                # Run stat in background to avoid blocking on slow mounts
+                from concurrent.futures import ThreadPoolExecutor
+                from PyQt5.QtCore import QTimer
+
+                def _stat():
+                    s = os.stat(path)
+                    d = os.path.isdir(path)
+                    return s, d
+
+                def _on_done(future):
+                    def _show():
+                        try:
+                            stat_result, is_dir = future.result()
+                            info_text = (
+                                f"Name: {os.path.basename(path)}\n"
+                                f"Path: {path}\n"
+                                f"Size: {self._format_size(stat_result.st_size) if not is_dir else '—'}\n"
+                                f"Modified: {datetime.fromtimestamp(stat_result.st_mtime)}\n"
+                                f"Permissions: {oct(stat_result.st_mode)[-3:]}\n"
+                                f"Type: {'Directory' if is_dir else 'File'}"
+                            )
+                            QMessageBox.information(self, "Properties", info_text)
+                        except Exception as e:
+                            QMessageBox.critical(self, "Error", str(e))
+                    QTimer.singleShot(0, _show)
+
+                executor = ThreadPoolExecutor(max_workers=1)
+                fut = executor.submit(_stat)
+                fut.add_done_callback(_on_done)
+                executor.shutdown(wait=False)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
+
+    # ── Async local file operations ──
+
+    def _async_local_copy(self, paths, dest_dir):
+        """Copy local files/dirs in a background thread (non-blocking)."""
+        import shutil
+        from concurrent.futures import ThreadPoolExecutor
+        from PyQt5.QtCore import QTimer
+
+        def _do_copy():
+            errors = []
+            for src in paths:
+                dst = os.path.join(dest_dir, os.path.basename(src))
+                if os.path.abspath(src) == os.path.abspath(dst):
+                    continue
+                try:
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(src, dst)
+                except Exception as e:
+                    logger.error(f"Local copy failed: {e}")
+                    errors.append((os.path.basename(src), str(e)))
+            return errors
+
+        def _on_done(future):
+            def _finish():
+                try:
+                    errors = future.result()
+                except Exception as e:
+                    errors = [("(unknown)", str(e))]
+                if errors:
+                    msg = "\n".join(f"{n}: {e}" for n, e in errors)
+                    QMessageBox.warning(self, "Copy Error",
+                                        f"Some files failed to copy:\n{msg}")
+                self.refresh()
+            QTimer.singleShot(0, _finish)
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(_do_copy).add_done_callback(_on_done)
+        executor.shutdown(wait=False)
+
+    def _async_local_delete(self, items):
+        """Delete local files/dirs in a background thread (non-blocking).
+
+        Args:
+            items: List of (path, is_dir) tuples.
+        """
+        import shutil
+        from concurrent.futures import ThreadPoolExecutor
+        from PyQt5.QtCore import QTimer
+
+        def _do_delete():
+            errors = []
+            for path, is_dir in items:
+                try:
+                    if is_dir:
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                except Exception as e:
+                    logger.error(f"Local delete failed: {e}")
+                    errors.append((os.path.basename(path), str(e)))
+            return errors
+
+        def _on_done(future):
+            def _finish():
+                try:
+                    errors = future.result()
+                except Exception as e:
+                    errors = [("(unknown)", str(e))]
+                self._clear_busy()
+                if errors:
+                    msg = "\n".join(f"{n}: {e}" for n, e in errors)
+                    QMessageBox.critical(self, "Delete Error",
+                                         f"Some items failed to delete:\n{msg}")
+                self.refresh()
+            QTimer.singleShot(0, _finish)
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(_do_delete).add_done_callback(_on_done)
+        executor.shutdown(wait=False)
 
     # ── Copy / Paste ──
 
@@ -1871,20 +2086,8 @@ class FileBrowserPane(QWidget):
                 'copy', src_paths=paths, dest_dir=target_dir
             )
         else:
-            # Local → Local = local file copy
-            import shutil
-            for src in paths:
-                dst = os.path.join(target_dir, os.path.basename(src))
-                if src == dst:
-                    continue
-                try:
-                    if os.path.isdir(src):
-                        shutil.copytree(src, dst)
-                    else:
-                        shutil.copy2(src, dst)
-                except Exception as e:
-                    logger.error(f"Local copy failed: {e}")
-            self.refresh()
+            # Local → Local = local file copy (background)
+            self._async_local_copy(paths, target_dir)
 
     # ── File Filter ──
 
@@ -1908,11 +2111,25 @@ class FileBrowserPane(QWidget):
             else:
                 item.setHidden(pattern not in name)
 
+    # ── Per-connection storage key helpers ──
+
+    def _connection_key(self) -> str:
+        """Return a unique string identifying the current connection.
+
+        Used to scope bookmarks and macros so each cluster (or Local)
+        gets its own independent set.
+
+        Examples:  ``"local"``  /  ``"cluster_<profile-uuid>"``
+        """
+        if self.connected_profile and hasattr(self.connected_profile, 'id'):
+            return f"cluster_{self.connected_profile.id}"
+        return "local"
+
     # ── Bookmark Methods ──
 
     def _load_bookmarks(self):
-        """Load bookmarks from QSettings."""
-        key = f"bookmarks_{'remote' if self.is_remote else 'local'}"
+        """Load bookmarks from QSettings (scoped to the current connection)."""
+        key = f"bookmarks_{self._connection_key()}"
         settings = QSettings("TransfPro", "TransfPro")
         count = settings.beginReadArray(key)
         self._bookmarks = []
@@ -1925,8 +2142,8 @@ class FileBrowserPane(QWidget):
         settings.endArray()
 
     def _save_bookmarks(self):
-        """Save bookmarks to QSettings."""
-        key = f"bookmarks_{'remote' if self.is_remote else 'local'}"
+        """Save bookmarks to QSettings (scoped to the current connection)."""
+        key = f"bookmarks_{self._connection_key()}"
         settings = QSettings("TransfPro", "TransfPro")
         settings.beginWriteArray(key, len(self._bookmarks))
         for i, (name, path) in enumerate(self._bookmarks):
@@ -2038,35 +2255,32 @@ class FileBrowserPane(QWidget):
     # ── Quick Transfer Macros ──────────────────────────────────────────
 
     def _load_transfer_macros(self):
-        """Load transfer macros from QSettings."""
+        """Load transfer macros from QSettings (scoped to the current connection)."""
+        key = f"transfer_macros_{self._connection_key()}"
         settings = QSettings("TransfPro", "TransfPro")
-        count = settings.beginReadArray("transfer_macros")
+        count = settings.beginReadArray(key)
         self._transfer_macros = []
         for i in range(count):
             settings.setArrayIndex(i)
             name = settings.value("name", "")
-            local_path = settings.value("local_path", "")
-            remote_path = settings.value("remote_path", "")
-            direction = settings.value("direction", "upload")
-            if name and local_path and remote_path:
+            files_str = settings.value("files", "")
+            files = [f for f in files_str.split("\n") if f.strip()] if files_str else []
+            if name and files:
                 self._transfer_macros.append({
                     'name': name,
-                    'local_path': local_path,
-                    'remote_path': remote_path,
-                    'direction': direction,
+                    'files': files,
                 })
         settings.endArray()
 
     def _save_transfer_macros(self):
-        """Save transfer macros to QSettings."""
+        """Save transfer macros to QSettings (scoped to the current connection)."""
+        key = f"transfer_macros_{self._connection_key()}"
         settings = QSettings("TransfPro", "TransfPro")
-        settings.beginWriteArray("transfer_macros", len(self._transfer_macros))
+        settings.beginWriteArray(key, len(self._transfer_macros))
         for i, macro in enumerate(self._transfer_macros):
             settings.setArrayIndex(i)
             settings.setValue("name", macro['name'])
-            settings.setValue("local_path", macro['local_path'])
-            settings.setValue("remote_path", macro['remote_path'])
-            settings.setValue("direction", macro['direction'])
+            settings.setValue("files", "\n".join(macro['files']))
         settings.endArray()
 
     def _rebuild_macro_buttons(self):
@@ -2102,14 +2316,13 @@ class FileBrowserPane(QWidget):
         layout.addWidget(label)
 
         for idx, macro in enumerate(self._transfer_macros):
-            arrow = "⬆" if macro['direction'] == 'upload' else "⬇"
-            btn = QPushButton(f"{arrow} {macro['name']}")
+            n_files = len(macro['files'])
+            btn = QPushButton(macro['name'])
             btn.setMaximumHeight(22)
-            if macro['direction'] == 'upload':
-                tip = f"Upload: {macro['local_path']} → {macro['remote_path']}"
-            else:
-                tip = f"Download: {macro['remote_path']} → {macro['local_path']}"
-            btn.setToolTip(f"{tip}\nRight-click to edit/remove")
+            file_list = ", ".join(macro['files'][:5])
+            if n_files > 5:
+                file_list += f" (+{n_files - 5} more)"
+            btn.setToolTip(f"Transfer: {file_list}\nRight-click to edit/remove")
             btn.setStyleSheet(macro_btn_qss)
             btn.setContextMenuPolicy(Qt.CustomContextMenu)
             btn.clicked.connect(
@@ -2145,10 +2358,12 @@ class FileBrowserPane(QWidget):
         layout.addStretch()
 
     def _run_transfer_macro(self, macro: dict):
-        """Execute a transfer macro by emitting the signal."""
-        self.transfer_macro_requested.emit(
-            macro['local_path'], macro['remote_path'], macro['direction']
-        )
+        """Execute a transfer macro by emitting the file list.
+
+        The FileTransferTab handler resolves source paths from this pane's
+        current directory and transfers to the opposite pane's current directory.
+        """
+        self.transfer_macro_requested.emit(macro['files'])
 
     def _add_transfer_macro(self):
         """Add a new transfer macro using current paths as defaults."""
@@ -2185,13 +2400,14 @@ class FileBrowserPane(QWidget):
     def _macro_dialog(self, existing: dict = None):
         """Show a dialog for creating/editing a transfer macro.
 
-        Returns a dict {name, local_path, remote_path, direction} or None.
+        Returns a dict {name, files} or None.
         """
-        from PyQt5.QtWidgets import QDialog, QFormLayout, QDialogButtonBox
+        from PyQt5.QtWidgets import (QDialog, QFormLayout, QDialogButtonBox,
+                                     QPlainTextEdit)
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Transfer Macro" if existing else "Add Transfer Macro")
-        dlg.setMinimumWidth(450)
+        dlg.setMinimumWidth(400)
         dlg.setStyleSheet("""
             QDialog {
                 background: #1e2030;
@@ -2201,15 +2417,7 @@ class FileBrowserPane(QWidget):
                 color: #cad3f5;
                 font-size: 12px;
             }
-            QLineEdit {
-                background: #24273a;
-                color: #cad3f5;
-                border: 1px solid #363a4f;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 12px;
-            }
-            QComboBox {
+            QLineEdit, QPlainTextEdit {
                 background: #24273a;
                 color: #cad3f5;
                 border: 1px solid #363a4f;
@@ -2235,38 +2443,24 @@ class FileBrowserPane(QWidget):
         form.setContentsMargins(16, 16, 16, 16)
 
         name_edit = QLineEdit()
-        name_edit.setPlaceholderText("e.g. Sync configs")
+        name_edit.setPlaceholderText("e.g. Config files")
         if existing:
             name_edit.setText(existing['name'])
 
-        local_edit = QLineEdit()
-        local_edit.setPlaceholderText("/home/user/data")
+        files_edit = QPlainTextEdit()
+        files_edit.setPlaceholderText(
+            "Enter file names, one per line\n"
+            "e.g.\n"
+            "config.yaml\n"
+            "data.csv\n"
+            "run.sh"
+        )
+        files_edit.setMinimumHeight(120)
         if existing:
-            local_edit.setText(existing['local_path'])
-        else:
-            # Default to current path if this is the local pane
-            if not self.is_remote:
-                local_edit.setText(self.current_path)
-
-        remote_edit = QLineEdit()
-        remote_edit.setPlaceholderText("/remote/data")
-        if existing:
-            remote_edit.setText(existing['remote_path'])
-        else:
-            # Default to current path if this is the remote pane
-            if self.is_remote:
-                remote_edit.setText(self.current_path)
-
-        direction_combo = QComboBox()
-        direction_combo.addItem("⬆ Upload (Local → Remote)", "upload")
-        direction_combo.addItem("⬇ Download (Remote → Local)", "download")
-        if existing and existing['direction'] == 'download':
-            direction_combo.setCurrentIndex(1)
+            files_edit.setPlainText("\n".join(existing['files']))
 
         form.addRow("Name:", name_edit)
-        form.addRow("Local Path:", local_edit)
-        form.addRow("Remote Path:", remote_edit)
-        form.addRow("Direction:", direction_combo)
+        form.addRow("File names:", files_edit)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
@@ -2277,15 +2471,12 @@ class FileBrowserPane(QWidget):
 
         if dlg.exec_() == QDialog.Accepted:
             name = name_edit.text().strip()
-            local_path = local_edit.text().strip()
-            remote_path = remote_edit.text().strip()
-            direction = direction_combo.currentData()
-            if name and local_path and remote_path:
+            raw = files_edit.toPlainText()
+            files = [f.strip() for f in raw.split("\n") if f.strip()]
+            if name and files:
                 return {
                     'name': name,
-                    'local_path': local_path,
-                    'remote_path': remote_path,
-                    'direction': direction,
+                    'files': files,
                 }
         return None
 

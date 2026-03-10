@@ -135,9 +135,6 @@ class AboutDialog(QDialog):
         libraries_text = QLabel(
             "• PyQt5 - Graphical User Interface Framework\n"
             "• Paramiko - SSH Protocol Implementation\n"
-            "• Matplotlib - Data Visualization and Charting\n"
-            "• PyQtGraph - High-Performance Graphics Library\n"
-            "• Keyring - Secure Credential Storage\n"
             "• Cryptography - Cryptographic Recipes and Primitives"
         )
         libraries_text.setWordWrap(True)

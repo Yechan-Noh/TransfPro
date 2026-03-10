@@ -28,14 +28,14 @@ a = Analysis(
     hiddenimports=[
         'paramiko',
         'cryptography',
-        'keyring',
-        'keyring.backends',
         'PyQt5.sip',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        # keyring accesses macOS Keychain and triggers permission prompts
+        'keyring', 'keyring.backends',
         # Heavy libraries not used by TransfPro
         'matplotlib', 'matplotlib.backends',
         'pyqtgraph',
@@ -77,7 +77,7 @@ exe = EXE(
     upx=True,
     console=False,  # No terminal window
     disable_windowed_traceback=False,
-    argv_emulation=True,  # macOS: handle file open events
+    argv_emulation=False,  # Disabled: causes macOS permission prompts via Apple Events
     target_arch=None,
     # For distribution: set your Apple Developer identity here
     # e.g., codesign_identity='Developer ID Application: Your Name (TEAMID)',

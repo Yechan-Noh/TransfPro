@@ -36,9 +36,9 @@ TRANSFER_TIMEOUT: int = 300  # seconds
 
 # SFTP Performance Tuning
 # Paramiko defaults are tiny (64KB window, 32KB packet) — increase for throughput
-SFTP_WINDOW_SIZE: int = 2 * 1024 * 1024      # 2 MB sliding window per channel
-SFTP_MAX_PACKET_SIZE: int = 64 * 1024         # 64 KB max packet (safe upper bound)
-SFTP_MAX_READ_SIZE: int = 64 * 1024           # 64 KB read request size for prefetch
+SFTP_WINDOW_SIZE: int = 4 * 1024 * 1024      # 4 MB sliding window per channel
+SFTP_MAX_PACKET_SIZE: int = 256 * 1024        # 256 KB max packet
+SFTP_MAX_READ_SIZE: int = 256 * 1024          # 256 KB read/write chunk size
 SFTP_OPERATION_TIMEOUT: int = 30              # Per-operation channel timeout (seconds)
 
 # Transfer speed update interval

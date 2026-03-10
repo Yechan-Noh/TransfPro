@@ -13,6 +13,7 @@ import logging
 import os
 import pty
 import re
+import select
 import shlex
 import socket
 import struct
@@ -129,8 +130,10 @@ class _RemoteReaderThread(QThread):
 class _LocalReaderThread(QThread):
     """Read from a local PTY master fd in the background.
 
-    ``os.read()`` blocks until data arrives or the fd is closed,
-    so no polling or sleep is needed.
+    Uses ``select()`` with a short timeout so the thread can check its
+    ``_running`` flag regularly and exit cleanly without relying on
+    ``os.close()`` from another thread (which has undefined behaviour
+    on Linux and can hang if the fd number was reused).
     """
     data_received = pyqtSignal(str)
     closed = pyqtSignal()
@@ -141,17 +144,22 @@ class _LocalReaderThread(QThread):
         self._running = True
 
     def run(self):
+        fd = self.master_fd
         try:
             while self._running:
                 try:
-                    data = os.read(self.master_fd, 4096)
+                    # Wait up to 100 ms for data; allows checking _running
+                    ready, _, _ = select.select([fd], [], [], 0.1)
+                    if not ready:
+                        continue  # timeout — check _running and loop
+                    data = os.read(fd, 4096)
                     if data:
                         self.data_received.emit(
                             data.decode('utf-8', errors='replace'))
                     else:
-                        break
-                except OSError:
-                    break
+                        break  # EOF
+                except (OSError, ValueError):
+                    break  # fd closed or invalid
             if self._running:
                 self.closed.emit()
         except Exception as e:
@@ -160,7 +168,7 @@ class _LocalReaderThread(QThread):
 
     def stop(self):
         self._running = False
-        self.wait(200)
+        self.wait(500)  # select timeout is 100 ms, so 500 ms is plenty
 
 
 # ── CSI tokenizer (same regex as TerminalTab) ──
@@ -534,46 +542,81 @@ class MiniTerminal(QWidget):
     def disconnect_terminal(self):
         """Tear down the shell session.
 
-        Closes the channel/fd BEFORE waiting on the reader thread so the
-        blocking read (os.read / channel.recv) is unblocked immediately
-        instead of waiting for the full timeout.
+        For remote terminals: closes the channel first (unblocks recv),
+        then waits for the reader thread.
+
+        For local terminals: signals the reader to stop first (it uses
+        select() with a timeout so it can exit on its own), waits for
+        it, THEN closes the fd.  This avoids the Linux undefined-
+        behaviour of os.close() on an fd that another thread is blocked
+        in os.read() on — which can hang if the fd number was reused
+        by another subsystem (e.g. Paramiko SSH sockets).
         """
         self._connected = False
 
-        # Close the I/O source first to unblock the reader thread's
-        # blocking read call — this makes stop().wait() return instantly.
-        if self._channel:
-            try:
-                self._channel.close()
-            except Exception:
-                pass
-            self._channel = None
-        if self._master_fd >= 0:
-            try:
-                os.close(self._master_fd)
-            except OSError:
-                pass
-            self._master_fd = -1
-        if self._process:
-            try:
-                self._process.terminate()
-            except Exception:
-                pass
-            self._process = None
+        if self.is_remote:
+            # ── Remote: close channel first to unblock recv() ──
+            if self._channel:
+                try:
+                    self._channel.close()
+                except Exception:
+                    pass
+                self._channel = None
 
-        # Disconnect signals first so no queued data_received calls
-        # arrive after the widget starts being destroyed (avoids
-        # "Cannot queue arguments of type QTextBlock/QTextCursor").
-        if self._reader:
-            try:
-                self._reader.data_received.disconnect()
-                self._reader.closed.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-            # Now wait on the reader — it should exit almost immediately
-            # since the fd/channel is already closed.
-            self._reader.stop()
-            self._reader = None
+            # Stop reader after channel is closed
+            if self._reader:
+                try:
+                    self._reader.data_received.disconnect()
+                    self._reader.closed.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                self._reader.stop()
+                self._reader = None
+
+        else:
+            # ── Local: kill process → stop reader → close fd ──
+            # Killing the process closes the slave end of the PTY,
+            # which makes select() on the master fd return readable
+            # and os.read() returns b'' (EOF).  This gives the reader
+            # a fast clean exit.  We must NOT os.close() the master fd
+            # while the reader thread might be in os.read() — on Linux
+            # that has undefined behaviour and hangs if the fd number
+            # was reused by another subsystem (e.g. Paramiko sockets).
+
+            # 1. Kill the subprocess (unblocks the reader via EOF)
+            if self._process:
+                try:
+                    import signal
+                    os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    try:
+                        self._process.terminate()
+                    except Exception:
+                        pass
+                try:
+                    self._process.wait(timeout=0.3)
+                except Exception:
+                    pass
+                self._process = None
+
+            # 2. Stop the reader thread (should exit almost immediately
+            #    now that the process is dead and the PTY sends EOF)
+            if self._reader:
+                try:
+                    self._reader.data_received.disconnect()
+                    self._reader.closed.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                self._reader.stop()
+                self._reader = None
+
+            # 3. Now safe to close the fd — no thread is reading it.
+            if self._master_fd >= 0:
+                try:
+                    os.close(self._master_fd)
+                except OSError:
+                    pass
+                self._master_fd = -1
 
         label = "Remote Shell" if self.is_remote else "Local Shell"
         self._header_label.setText(label)
@@ -833,8 +876,9 @@ class MiniTerminal(QWidget):
             if col > 0:
                 cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, min(col, line_len))
         elif final in ('H', 'f'):  # Cursor Position  \x1b[row;colH
-            row = max((params[0] if len(params) > 0 else 1), 1)
-            col = max((params[1] if len(params) > 1 else 1), 1)
+            # Clamp to sane limits to prevent memory exhaustion
+            row = min(max((params[0] if len(params) > 0 else 1), 1), 500)
+            col = min(max((params[1] if len(params) > 1 else 1), 1), 500)
             doc = cursor.document()
             while doc.blockCount() < row:
                 cursor.movePosition(QTextCursor.End)

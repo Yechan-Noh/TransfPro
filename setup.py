@@ -12,7 +12,6 @@ setup(
         "PyQt5>=5.15.0,<6.0.0",
         "paramiko>=3.0.0,<4.0.0",
         "cryptography>=38.0.0,<44.0.0",
-        "keyring>=24.0.0,<26.0.0",
     ],
     entry_points={
         "console_scripts": [

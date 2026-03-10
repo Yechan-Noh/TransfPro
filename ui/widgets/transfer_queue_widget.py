@@ -415,7 +415,16 @@ class TransferQueueWidget(QWidget):
             self.transfer_list.addItem(item)
             self.transfer_list.setItemWidget(item, widget)
 
-            self._update_statistics()
+            # Debounce statistics update — avoid recalculating on every add
+            # when many transfers are queued in rapid succession
+            if not hasattr(self, '_stats_timer'):
+                from PyQt5.QtCore import QTimer
+                self._stats_timer = QTimer(self)
+                self._stats_timer.setSingleShot(True)
+                self._stats_timer.setInterval(50)
+                self._stats_timer.timeout.connect(self._update_statistics)
+            self._stats_timer.start()
+
             logger.info(f"Added transfer: {transfer.task_id}")
 
         except Exception as e:
@@ -506,13 +515,14 @@ class TransferQueueWidget(QWidget):
         for task_id in completed_ids:
             if task_id in self.transfer_widgets:
                 # Find and remove the item
+                w = self.transfer_widgets[task_id]
                 for i in range(self.transfer_list.count()):
                     item = self.transfer_list.item(i)
                     widget = self.transfer_list.itemWidget(item)
-                    if widget is self.transfer_widgets[task_id]:
+                    if widget is w:
                         self.transfer_list.takeItem(i)
                         break
-
+                w.deleteLater()
                 del self.transfer_widgets[task_id]
             del self.transfers[task_id]
 

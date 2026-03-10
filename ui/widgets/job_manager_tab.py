@@ -3,6 +3,9 @@ Main Job Manager tab for TransfPro.
 
 This module provides the JobManagerTab widget for job submission and monitoring,
 with automatic refresh, detailed job views, and log access.
+
+Supports multiple clusters simultaneously — each connected cluster in the
+File Transfer tab appears as a selectable button in the Monitoring tab.
 """
 
 import logging
@@ -13,7 +16,7 @@ from PyQt5.QtWidgets import (
     QFormLayout, QPlainTextEdit, QMessageBox, QDialog, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal, pyqtSlot, QSize
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QFont
 
 from transfpro.core.slurm_manager import SLURMManager, JobInfo
 from transfpro.core.sftp_manager import SFTPManager
@@ -76,31 +79,42 @@ class CancelJobWorker(QObject):
 
 
 class JobManagerTab(QWidget):
-    """Job submission and monitoring interface."""
+    """Job submission and monitoring interface with multi-cluster support.
+
+    Clusters are added/removed dynamically via ``sync_cluster_connected``
+    and ``sync_cluster_disconnected``, driven by File Transfer pane
+    connect/disconnect events.
+    """
 
     view_log_requested = pyqtSignal(str, str)  # job_id, log_path
     open_directory_requested = pyqtSignal(str)  # remote path
 
-    def __init__(self, slurm_manager: SLURMManager, ssh_manager,
-                 sftp_manager: SFTPManager, gromacs_parser: GromacsLogParser,
+    def __init__(self, gromacs_parser: GromacsLogParser,
                  database: Database, parent=None):
         """
         Initialize the Job Manager tab.
 
         Args:
-            slurm_manager: SLURMManager instance
-            ssh_manager: SSHManager instance
-            sftp_manager: SFTPManager instance
             gromacs_parser: GromacsLogParser instance
             database: Database instance
             parent: Parent widget
         """
         super().__init__(parent)
-        self.slurm_manager = slurm_manager
-        self.ssh_manager = ssh_manager
-        self.sftp_manager = sftp_manager
         self.gromacs_parser = gromacs_parser
         self.database = database
+
+        # ── Multi-cluster state ──
+        # key (profile.id str) → dict with:
+        #   ssh_manager, slurm_manager, sftp_manager, profile, sides (set)
+        self._clusters: dict = {}
+        self._active_key: Optional[str] = None
+        self._cluster_buttons: dict = {}      # key → QPushButton
+        self._cluster_btn_actions: dict = {}  # key → QAction (for toolbar removal)
+
+        # Convenience aliases updated when the active cluster changes
+        self.ssh_manager = None
+        self.slurm_manager = None
+        self.sftp_manager = None
 
         self.query_thread: Optional[QThread] = None
         self.query_worker: Optional[JobQueryWorker] = None
@@ -112,15 +126,164 @@ class JobManagerTab(QWidget):
         self._setup_connections()
         self._setup_auto_refresh()
 
+    # ──────────────────────────────────────────────────────
+    #  Public sync API — called from MainWindow
+    # ──────────────────────────────────────────────────────
+
+    def sync_cluster_connected(self, side: str, ssh_manager, profile):
+        """Register a newly connected remote cluster.
+
+        If the same cluster (by profile.id) is already tracked (e.g.
+        connected on both FT sides), just record the extra side.
+        """
+        key = str(profile.id)
+
+        if key in self._clusters:
+            # Same cluster on another side — just note the side
+            self._clusters[key]['sides'].add(side)
+            return
+
+        slurm = SLURMManager(ssh_manager)
+        sftp = SFTPManager(ssh_manager)
+        self._clusters[key] = {
+            'ssh_manager': ssh_manager,
+            'slurm_manager': slurm,
+            'sftp_manager': sftp,
+            'profile': profile,
+            'sides': {side},
+            'jobs': [],
+        }
+        self._add_cluster_button(key, profile.name)
+
+        # First cluster → make it active
+        if self._active_key is None:
+            self._switch_to_cluster(key)
+
+    def sync_cluster_disconnected(self, side: str):
+        """Remove clusters registered from *side*.
+
+        If a cluster was connected on both sides and only one disconnects,
+        the cluster stays until both sides disconnect.
+        """
+        keys_to_remove = []
+        for key, ctx in self._clusters.items():
+            if side in ctx['sides']:
+                ctx['sides'].discard(side)
+                if not ctx['sides']:
+                    keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            self._remove_cluster(key)
+
+    # ──────────────────────────────────────────────────────
+    #  Cluster management helpers
+    # ──────────────────────────────────────────────────────
+
+    def _add_cluster_button(self, key: str, name: str):
+        """Add a toggle button for *key* to the toolbar."""
+        btn = QPushButton(name)
+        btn.setCheckable(True)
+        btn.setStyleSheet("""
+            QPushButton {
+                padding: 4px 14px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #2b2b2b;
+                color: #ccc;
+            }
+            QPushButton:checked {
+                background: #1565C0;
+                color: white;
+                border-color: #1976D2;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #3a3a3a;
+            }
+            QPushButton:checked:hover {
+                background: #1976D2;
+            }
+        """)
+        btn.clicked.connect(lambda checked, k=key: self._on_cluster_button_clicked(k))
+        action = self._toolbar.addWidget(btn)
+        self._cluster_buttons[key] = btn
+        self._cluster_btn_actions[key] = action
+
+        # Show the separator before cluster buttons
+        self._cluster_separator.setVisible(True)
+
+    def _remove_cluster(self, key: str):
+        """Remove a cluster and its button. Switch active if needed."""
+        # Always stop running workers — they may reference this cluster
+        self._cleanup_query_thread()
+        self._cleanup_cancel_thread()
+
+        # Remove button from toolbar
+        btn = self._cluster_buttons.pop(key, None)
+        if btn:
+            # Find the QAction that wraps this button widget and remove it
+            action = self._cluster_btn_actions.pop(key, None)
+            if action:
+                self._toolbar.removeAction(action)
+            btn.deleteLater()
+
+        # Remove context
+        self._clusters.pop(key, None)
+
+        # If we removed the active cluster, switch to another or show placeholder
+        if self._active_key == key:
+            self._active_key = None
+            self.ssh_manager = None
+            self.slurm_manager = None
+            self.sftp_manager = None
+            self.job_table.update_jobs([])
+
+            remaining = list(self._clusters.keys())
+            if remaining:
+                self._switch_to_cluster(remaining[0])
+            else:
+                # No clusters left — hide the separator
+                self._cluster_separator.setVisible(False)
+
+    def _on_cluster_button_clicked(self, key: str):
+        """Handle cluster button click — switch to that cluster."""
+        if key == self._active_key:
+            # Re-check the button (don't allow un-toggle)
+            self._cluster_buttons[key].setChecked(True)
+            return
+        self._switch_to_cluster(key)
+
+    def _switch_to_cluster(self, key: str):
+        """Make *key* the active cluster and refresh its jobs."""
+        ctx = self._clusters.get(key)
+        if not ctx:
+            return
+
+        self._active_key = key
+        self.ssh_manager = ctx['ssh_manager']
+        self.slurm_manager = ctx['slurm_manager']
+        self.sftp_manager = ctx['sftp_manager']
+
+        # Update button highlights
+        for k, btn in self._cluster_buttons.items():
+            btn.setChecked(k == key)
+
+        # Refresh job table for this cluster
+        self.refresh_jobs()
+
+    # ──────────────────────────────────────────────────────
+    #  UI setup
+    # ──────────────────────────────────────────────────────
+
     def _setup_ui(self):
         """Set up the UI layout."""
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Toolbar
-        toolbar = self._create_toolbar()
-        layout.addWidget(toolbar)
+        # Toolbar (cluster buttons are added to the right side dynamically)
+        self._toolbar = self._create_toolbar()
+        layout.addWidget(self._toolbar)
 
         # Main content: Horizontal splitter — table (left) + details (right)
         splitter = QSplitter(Qt.Horizontal)
@@ -211,6 +374,10 @@ class JobManagerTab(QWidget):
         template_btn = QPushButton("Templates")
         template_btn.clicked.connect(self._on_templates_clicked)
         toolbar.addWidget(template_btn)
+
+        # Separator before cluster buttons (hidden until clusters connect)
+        self._cluster_separator = toolbar.addSeparator()
+        self._cluster_separator.setVisible(False)
 
         return toolbar
 
@@ -338,6 +505,10 @@ class JobManagerTab(QWidget):
 
     def refresh_jobs(self):
         """Fetch jobs using worker thread."""
+        # No active cluster — nothing to query
+        if self._active_key is None or self.ssh_manager is None:
+            return
+
         # Don't query if not connected
         if not self.ssh_manager.is_connected():
             return
@@ -356,8 +527,9 @@ class JobManagerTab(QWidget):
         self.query_thread = QThread()
         # Filter jobs by connected user
         username = None
-        if hasattr(self.ssh_manager, '_profile') and self.ssh_manager._profile:
-            username = self.ssh_manager._profile.username
+        ctx = self._clusters.get(self._active_key)
+        if ctx and ctx['profile']:
+            username = ctx['profile'].username
         self.query_worker = JobQueryWorker(self.slurm_manager, user=username)
         self.query_worker.moveToThread(self.query_thread)
 
@@ -388,8 +560,6 @@ class JobManagerTab(QWidget):
             error: Error message
         """
         logger.error(f"Job query error: {error}")
-        # Optionally show error to user
-        # QMessageBox.warning(self, "Error", f"Failed to query jobs: {error}")
 
     def _restore_refresh_btn(self):
         """Re-enable the Refresh button after a query finishes."""
@@ -398,6 +568,10 @@ class JobManagerTab(QWidget):
 
     def on_submit_job(self):
         """Open job submit dialog."""
+        if not self.slurm_manager or not self.sftp_manager:
+            QMessageBox.warning(self, "Not Connected",
+                                "Please connect a cluster first.")
+            return
         dialog = JobSubmitDialog(
             self.slurm_manager,
             self.sftp_manager,
@@ -422,6 +596,9 @@ class JobManagerTab(QWidget):
         """Run scancel for given job IDs in a background thread."""
         if self.cancel_thread and self.cancel_thread.isRunning():
             logger.warning("Cancel already in progress")
+            return
+
+        if not self.ssh_manager:
             return
 
         self._cleanup_cancel_thread()
@@ -563,6 +740,11 @@ class JobManagerTab(QWidget):
             )
             return
 
+        if not self.ssh_manager:
+            QMessageBox.warning(self, "Not Connected",
+                                "No cluster connection available.")
+            return
+
         # Use the output_file from squeue if available, otherwise default
         if getattr(job, 'output_file', '') and job.output_file:
             log_path = job.output_file
@@ -630,7 +812,7 @@ class JobManagerTab(QWidget):
         Locates the job's submission script via scontrol and runs sbatch
         from the job's working directory.
         """
-        if not self.ssh_manager.is_connected():
+        if not self.ssh_manager or not self.ssh_manager.is_connected():
             QMessageBox.warning(self, "Not Connected", "Please connect first.")
             return
 

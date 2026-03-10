@@ -2,21 +2,31 @@
 
 This module provides a QObject worker that handles file uploads and
 downloads in background threads with real-time progress reporting.
+
+Directory transfers use ``tar`` piped over SSH when available for
+dramatically higher throughput (avoids per-file SFTP overhead).
+Falls back to parallel SFTP channels when ``tar`` is not available.
 """
 
 import os
 import stat as stat_mod
+import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from PyQt5.QtCore import pyqtSignal
 
 from transfpro.core.sftp_manager import SFTPManager
 from transfpro.config.constants import (
     TRANSFER_SPEED_UPDATE_INTERVAL, PROGRESS_EMIT_INTERVAL,
+    SFTP_WINDOW_SIZE, SFTP_MAX_PACKET_SIZE,
 )
 from transfpro.models.transfer import TransferTask, TransferDirection, TransferStatus
 from .base_worker import BaseWorker
+
+# Number of parallel SFTP channels for directory transfers
+_DIR_PARALLEL_CHANNELS = 4
 
 
 class TransferWorker(BaseWorker):
@@ -54,6 +64,8 @@ class TransferWorker(BaseWorker):
         self._last_progress_emit_time = 0.0
         self._chunk_counter = 0
         self._dedicated_sftp = None  # dedicated SFTP session for thread safety
+        self._bytes_done = 0  # atomic-ish counter for parallel transfers
+        self._bytes_lock = threading.Lock()
 
     def cancel(self):
         """Cancel the transfer, waking it first if paused."""
@@ -75,7 +87,7 @@ class TransferWorker(BaseWorker):
     def _progress_callback(self, bytes_transferred: int, bytes_total: int):
         """Handle progress updates from SFTP operations.
 
-        Checks cancel/pause every 16 chunks (~1 MB) to minimize overhead
+        Checks cancel/pause every 16 chunks (~4 MB) to minimize overhead
         while keeping responsiveness.  Throttles signal emission to ~10 Hz.
 
         Args:
@@ -142,7 +154,6 @@ class TransferWorker(BaseWorker):
         try:
             self.transfer_task.status = TransferStatus.IN_PROGRESS
             self.transfer_task.started_at = datetime.now()
-            self.transfer_started.emit(self.transfer_task.id)
 
             self.status_message.emit(
                 f"{'Uploading' if self.transfer_task.direction == TransferDirection.UPLOAD else 'Downloading'} "
@@ -160,6 +171,9 @@ class TransferWorker(BaseWorker):
             except Exception as e:
                 self.logger.error(f"Failed to open dedicated SFTP session: {e}")
                 raise
+
+            # Only signal "started" after SFTP session is ready
+            self.transfer_started.emit(self.transfer_task.id)
 
             # Initialize speed tracking
             self._last_progress_time = time.time()
@@ -359,16 +373,357 @@ class TransferWorker(BaseWorker):
                 except FileNotFoundError:
                     raise
 
-    def _upload_directory(self, local_dir: str, remote_dir: str) -> bool:
-        """Recursively upload a directory with progress tracking.
+    # ──────────────────────────────────────────────────────
+    #  tar+pipe fast directory transfer
+    # ──────────────────────────────────────────────────────
 
-        Creates the remote directory structure in one SSH round-trip,
-        then uploads files with pipelined writes and progress tracking.
+    def _tar_upload_directory(self, local_dir: str, remote_dir: str) -> bool:
+        """Upload a directory using tar piped over SSH.
+
+        Runs ``tar czf -`` locally and pipes into ``tar xzf -`` on the
+        remote side over a single SSH channel.  Dramatically faster than
+        per-file SFTP for directories with many small files.
+
+        Returns True on success, False on failure.
         """
+        import shlex
+
+        self.logger.info(f"tar+pipe upload: {local_dir} -> {remote_dir}")
+
+        # Compute total bytes for progress (quick local walk)
+        total_bytes = 0
+        for root, _dirs, files in os.walk(local_dir, followlinks=True):
+            for f in files:
+                try:
+                    total_bytes += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        if total_bytes > 0:
+            self.transfer_task.total_bytes = total_bytes
+
+        # Create remote directory
+        self._ssh_mkdir_p([remote_dir])
+
+        # Open a raw SSH channel for the tar extract command
+        transport = self.sftp_manager.ssh._client.get_transport()
+        if not transport:
+            return False
+
+        chan = transport.open_session()
+        chan.exec_command(f"tar xzf - -C {shlex.quote(remote_dir)}")
+
+        # Run local tar in a subprocess, pipe its stdout to the channel
+        tar_proc = subprocess.Popen(
+            ["tar", "czf", "-", "-C", local_dir, "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        bytes_sent = 0
+        buf_size = 256 * 1024  # 256 KB chunks for throughput
+
+        try:
+            while True:
+                if self.is_cancelled:
+                    tar_proc.kill()
+                    try:
+                        tar_proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        tar_proc.terminate()
+                    chan.close()
+                    raise InterruptedError("Transfer cancelled by user")
+
+                chunk = tar_proc.stdout.read(buf_size)
+                if not chunk:
+                    break
+                chan.sendall(chunk)
+                bytes_sent += len(chunk)
+
+                # Emit progress (compressed bytes vs uncompressed total is
+                # approximate, but gives useful feedback)
+                self._progress_callback(
+                    min(bytes_sent, total_bytes) if total_bytes else bytes_sent,
+                    total_bytes or bytes_sent
+                )
+
+            # Signal EOF to remote tar
+            chan.shutdown_write()
+
+            # Wait for remote tar to finish
+            exit_status = chan.recv_exit_status()
+            tar_proc.wait()
+            chan.close()
+
+            if exit_status != 0:
+                self.logger.warning(f"Remote tar exited with code {exit_status}")
+                return False
+
+            if tar_proc.returncode != 0:
+                stderr = tar_proc.stderr.read().decode(errors='replace')
+                self.logger.warning(f"Local tar error: {stderr}")
+                return False
+
+            return True
+
+        except InterruptedError:
+            raise
+        except Exception as e:
+            self.logger.error(f"tar+pipe upload failed: {e}")
+            try:
+                tar_proc.kill()
+            except Exception:
+                pass
+            try:
+                chan.close()
+            except Exception:
+                pass
+            return False
+
+    def _tar_download_directory(self, remote_dir: str, local_dir: str) -> bool:
+        """Download a directory using tar piped over SSH.
+
+        Runs ``tar czf -`` on the remote side and unpacks locally.
+        Dramatically faster than per-file SFTP for many small files.
+
+        Returns True on success, False on failure.
+        """
+        import shlex
+
+        self.logger.info(f"tar+pipe download: {remote_dir} -> {local_dir}")
+        os.makedirs(local_dir, exist_ok=True)
+
+        # Get total bytes from remote for progress tracking
+        total_bytes = 0
+        try:
+            stdout, _, code = self.sftp_manager.ssh.execute_command(
+                f"du -sb {shlex.quote(remote_dir)} 2>/dev/null || "
+                f"du -sk {shlex.quote(remote_dir)} 2>/dev/null",
+                timeout=30
+            )
+            if code == 0 and stdout.strip():
+                # du -sb gives bytes, du -sk gives KB
+                parts = stdout.strip().split()
+                val = int(parts[0])
+                # Heuristic: if > 10M, it's probably bytes (du -sb worked)
+                if val > 10_000_000 or 'b' in stdout.lower():
+                    total_bytes = val
+                else:
+                    total_bytes = val * 1024  # du -sk → bytes
+        except Exception:
+            pass
+        if total_bytes > 0:
+            self.transfer_task.total_bytes = total_bytes
+
+        # Open SSH channel for remote tar
+        transport = self.sftp_manager.ssh._client.get_transport()
+        if not transport:
+            return False
+
+        chan = transport.open_session()
+        chan.exec_command(f"tar czf - -C {shlex.quote(remote_dir)} .")
+
+        # Pipe channel output to local tar
+        tar_proc = subprocess.Popen(
+            ["tar", "xzf", "-", "-C", local_dir],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        bytes_received = 0
+        buf_size = 256 * 1024
+
+        try:
+            while True:
+                if self.is_cancelled:
+                    tar_proc.kill()
+                    try:
+                        tar_proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        tar_proc.terminate()
+                    chan.close()
+                    raise InterruptedError("Transfer cancelled by user")
+
+                chunk = chan.recv(buf_size)
+                if not chunk:
+                    break
+                tar_proc.stdin.write(chunk)
+                bytes_received += len(chunk)
+
+                self._progress_callback(
+                    min(bytes_received, total_bytes) if total_bytes else bytes_received,
+                    total_bytes or bytes_received
+                )
+
+            tar_proc.stdin.close()
+            tar_proc.wait()
+
+            exit_status = chan.recv_exit_status()
+            chan.close()
+
+            if tar_proc.returncode != 0:
+                stderr = tar_proc.stderr.read().decode(errors='replace')
+                self.logger.warning(f"Local tar error: {stderr}")
+                return False
+
+            if exit_status != 0:
+                self.logger.warning(f"Remote tar exited with code {exit_status}")
+                return False
+
+            return True
+
+        except InterruptedError:
+            raise
+        except Exception as e:
+            self.logger.error(f"tar+pipe download failed: {e}")
+            try:
+                tar_proc.kill()
+            except Exception:
+                pass
+            try:
+                chan.close()
+            except Exception:
+                pass
+            return False
+
+    def _remote_has_tar(self) -> bool:
+        """Check if tar is available on the remote host."""
+        try:
+            _, _, code = self.sftp_manager.ssh.execute_command(
+                "command -v tar", timeout=5
+            )
+            return code == 0
+        except Exception:
+            return False
+
+    def _local_has_tar(self) -> bool:
+        """Check if tar is available locally."""
+        try:
+            result = subprocess.run(
+                ["tar", "--version"],
+                capture_output=True, timeout=5
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    # ──────────────────────────────────────────────────────
+    #  Parallel SFTP directory transfer (fallback)
+    # ──────────────────────────────────────────────────────
+
+    def _open_extra_sftp(self):
+        """Open an additional SFTP session for parallel transfers."""
+        transport = self.sftp_manager.ssh._client.get_transport()
+        chan = transport.open_session(
+            window_size=SFTP_WINDOW_SIZE,
+            max_packet_size=SFTP_MAX_PACKET_SIZE,
+        )
+        chan.invoke_subsystem("sftp")
+        from paramiko import SFTPClient
+        return SFTPClient(chan)
+
+    def _parallel_upload_file(self, sftp_client, local_file, remote_file, fsize,
+                              total_bytes):
+        """Upload a single file using the given SFTP client.
+        Thread-safe — updates shared byte counter.
+        """
+        from transfpro.config.constants import SFTP_MAX_READ_SIZE
+        written = 0
+        chunk_count = 0
+        with open(local_file, 'rb') as lf:
+            with sftp_client.open(remote_file, 'wb') as rf:
+                rf.set_pipelined(True)
+                while True:
+                    if self.is_cancelled:
+                        raise InterruptedError("Transfer cancelled")
+                    chunk = lf.read(SFTP_MAX_READ_SIZE)
+                    if not chunk:
+                        break
+                    rf.write(chunk)
+                    written += len(chunk)
+                    chunk_count += 1
+                    with self._bytes_lock:
+                        self._bytes_done += len(chunk)
+                        current = self._bytes_done
+                    # Emit progress every 4 chunks (~1 MB with 256 KB chunks)
+                    if chunk_count % 4 == 0:
+                        self._progress_callback(current, total_bytes)
+        # Final progress for this file
+        with self._bytes_lock:
+            current = self._bytes_done
+        self._progress_callback(current, total_bytes)
+
+    def _parallel_download_file(self, sftp_client, remote_file, local_file, fsize,
+                                total_bytes):
+        """Download a single file using the given SFTP client.
+        Thread-safe — updates shared byte counter.
+        """
+        from transfpro.config.constants import SFTP_MAX_READ_SIZE
+        os.makedirs(os.path.dirname(local_file) or ".", exist_ok=True)
+        chunk_count = 0
+        with sftp_client.open(remote_file, 'rb') as rf:
+            rf.prefetch(fsize)
+            with open(local_file, 'wb', buffering=1024 * 1024) as lf:
+                while True:
+                    if self.is_cancelled:
+                        raise InterruptedError("Transfer cancelled")
+                    chunk = rf.read(SFTP_MAX_READ_SIZE)
+                    if not chunk:
+                        break
+                    lf.write(chunk)
+                    chunk_count += 1
+                    with self._bytes_lock:
+                        self._bytes_done += len(chunk)
+                        current = self._bytes_done
+                    # Emit progress every 4 chunks (~1 MB with 256 KB chunks)
+                    if chunk_count % 4 == 0:
+                        self._progress_callback(current, total_bytes)
+        # Final progress for this file
+        with self._bytes_lock:
+            current = self._bytes_done
+        self._progress_callback(current, total_bytes)
+
+    # ──────────────────────────────────────────────────────
+    #  Directory transfer entry points
+    # ──────────────────────────────────────────────────────
+
+    def _upload_directory(self, local_dir: str, remote_dir: str) -> bool:
+        """Upload a directory.
+
+        Strategy:
+        1. Try tar+pipe (fastest — avoids per-file SFTP overhead)
+        2. Fall back to parallel SFTP channels
+        """
+        # Try tar+pipe first
+        if self._local_has_tar() and self._remote_has_tar():
+            self.logger.info("Using tar+pipe for directory upload")
+            result = self._tar_upload_directory(local_dir, remote_dir)
+            if result:
+                return True
+            self.logger.warning("tar+pipe failed, falling back to parallel SFTP")
+
+        return self._sftp_upload_directory(local_dir, remote_dir)
+
+    def _download_directory(self, remote_dir: str, local_dir: str) -> bool:
+        """Download a directory.
+
+        Strategy:
+        1. Try tar+pipe (fastest)
+        2. Fall back to parallel SFTP channels
+        """
+        if self._local_has_tar() and self._remote_has_tar():
+            self.logger.info("Using tar+pipe for directory download")
+            result = self._tar_download_directory(remote_dir, local_dir)
+            if result:
+                return True
+            self.logger.warning("tar+pipe failed, falling back to parallel SFTP")
+
+        return self._sftp_download_directory(remote_dir, local_dir)
+
+    def _sftp_upload_directory(self, local_dir: str, remote_dir: str) -> bool:
+        """Upload a directory using parallel SFTP channels."""
         sftp = self._dedicated_sftp
 
         # Walk local tree: collect dirs and files
-        # followlinks=True so symlinked directories (e.g. GROMACS .ff) are traversed
         dir_list = [remote_dir]
         file_list = []  # [(local, remote, size)]
         total_bytes = 0
@@ -379,7 +734,6 @@ class TransferWorker(BaseWorker):
                 dir_list.append(f"{remote_dir}/{rel}".replace(os.sep, "/"))
             for f in files:
                 local_file = os.path.join(root, f)
-                # Resolve symlinks so we can read the actual file
                 real_file = os.path.realpath(local_file)
                 if not os.path.isfile(real_file):
                     self.logger.warning(f"Skipping non-file: {local_file}")
@@ -389,54 +743,64 @@ class TransferWorker(BaseWorker):
                 try:
                     size = os.path.getsize(real_file)
                 except OSError:
-                    self.logger.warning(f"Skipping inaccessible file: {local_file}")
+                    self.logger.warning(f"Skipping inaccessible: {local_file}")
                     continue
                 file_list.append((real_file, remote_file, size))
                 total_bytes += size
 
         self.logger.info(
-            f"Directory upload: {len(dir_list)} dirs, {len(file_list)} files, "
-            f"{total_bytes} bytes total"
+            f"Parallel SFTP upload: {len(dir_list)} dirs, "
+            f"{len(file_list)} files, {total_bytes} bytes"
         )
 
-        # Update total_bytes on the task so progress bar scales correctly
         if total_bytes > 0:
             self.transfer_task.total_bytes = total_bytes
 
-        # Create all remote directories in one SSH round-trip
+        # Create all remote directories
         self._ssh_mkdir_p(sorted(dir_list))
 
-        # Upload files
-        bytes_done = 0
-        from transfpro.config.constants import SFTP_MAX_READ_SIZE
+        # Open extra SFTP sessions for parallelism
+        n_channels = min(_DIR_PARALLEL_CHANNELS, len(file_list))
+        extra_sftps = []
+        for _ in range(n_channels - 1):
+            try:
+                extra_sftps.append(self._open_extra_sftp())
+            except Exception as e:
+                self.logger.warning(f"Could not open extra SFTP channel: {e}")
+                break
+        all_sftps = [sftp] + extra_sftps
 
-        for local_file, remote_file, fsize in file_list:
-            if self.is_cancelled:
-                raise InterruptedError("Transfer cancelled by user")
+        self._bytes_done = 0
 
-            written = 0
-            with open(local_file, 'rb') as lf:
-                with sftp.open(remote_file, 'wb') as rf:
-                    rf.set_pipelined(True)
-                    while True:
-                        chunk = lf.read(SFTP_MAX_READ_SIZE)
-                        if not chunk:
-                            break
-                        rf.write(chunk)
-                        written += len(chunk)
-                        self._progress_callback(bytes_done + written, total_bytes)
+        try:
+            with ThreadPoolExecutor(max_workers=len(all_sftps)) as pool:
+                futures = []
+                for i, (lf, rf, sz) in enumerate(file_list):
+                    sftp_client = all_sftps[i % len(all_sftps)]
+                    futures.append(pool.submit(
+                        self._parallel_upload_file,
+                        sftp_client, lf, rf, sz, total_bytes
+                    ))
 
-            bytes_done += fsize
-            self.logger.debug(f"Uploaded {remote_file}")
+                for future in as_completed(futures):
+                    future.result()  # Raises if the upload failed
 
-        return True
+            return True
 
-    def _download_directory(self, remote_dir: str, local_dir: str) -> bool:
-        """Recursively download a directory with progress tracking.
+        except InterruptedError:
+            raise
+        except Exception as e:
+            self.logger.error(f"Parallel upload error: {e}")
+            return False
+        finally:
+            for s in extra_sftps:
+                try:
+                    s.close()
+                except Exception:
+                    pass
 
-        Walks the remote directory tree, creates local directories,
-        then downloads all files one by one with progress updates.
-        """
+    def _sftp_download_directory(self, remote_dir: str, local_dir: str) -> bool:
+        """Download a directory using parallel SFTP channels."""
         sftp = self._dedicated_sftp
         os.makedirs(local_dir, exist_ok=True)
 
@@ -459,34 +823,49 @@ class TransferWorker(BaseWorker):
         _walk(remote_dir, local_dir)
 
         self.logger.info(
-            f"Directory download: {len(file_list)} files, {total_bytes} bytes total"
+            f"Parallel SFTP download: {len(file_list)} files, "
+            f"{total_bytes} bytes"
         )
 
         if total_bytes > 0:
             self.transfer_task.total_bytes = total_bytes
 
-        # Download files
-        bytes_done = 0
-        from transfpro.config.constants import SFTP_MAX_READ_SIZE
+        # Open extra SFTP sessions
+        n_channels = min(_DIR_PARALLEL_CHANNELS, len(file_list))
+        extra_sftps = []
+        for _ in range(n_channels - 1):
+            try:
+                extra_sftps.append(self._open_extra_sftp())
+            except Exception as e:
+                self.logger.warning(f"Could not open extra SFTP channel: {e}")
+                break
+        all_sftps = [sftp] + extra_sftps
 
-        for remote_file, local_file, fsize in file_list:
-            if self.is_cancelled:
-                raise InterruptedError("Transfer cancelled by user")
+        self._bytes_done = 0
 
-            os.makedirs(os.path.dirname(local_file) or ".", exist_ok=True)
-            read_bytes = 0
-            with sftp.open(remote_file, 'rb') as rf:
-                rf.prefetch(fsize)
-                with open(local_file, 'wb', buffering=1024 * 1024) as lf:
-                    while True:
-                        chunk = rf.read(SFTP_MAX_READ_SIZE)
-                        if not chunk:
-                            break
-                        lf.write(chunk)
-                        read_bytes += len(chunk)
-                        self._progress_callback(bytes_done + read_bytes, total_bytes)
+        try:
+            with ThreadPoolExecutor(max_workers=len(all_sftps)) as pool:
+                futures = []
+                for i, (rf, lf, sz) in enumerate(file_list):
+                    sftp_client = all_sftps[i % len(all_sftps)]
+                    futures.append(pool.submit(
+                        self._parallel_download_file,
+                        sftp_client, rf, lf, sz, total_bytes
+                    ))
 
-            bytes_done += fsize
-            self.logger.debug(f"Downloaded {local_file}")
+                for future in as_completed(futures):
+                    future.result()
 
-        return True
+            return True
+
+        except InterruptedError:
+            raise
+        except Exception as e:
+            self.logger.error(f"Parallel download error: {e}")
+            return False
+        finally:
+            for s in extra_sftps:
+                try:
+                    s.close()
+                except Exception:
+                    pass

@@ -243,23 +243,19 @@ class NotificationManager:
 
     def _notify_macos(self, title: str, message: str):
         """
-        Send macOS notification using osascript.
+        Send macOS notification via Qt tray icon.
+
+        We intentionally avoid osascript/AppleScript because every call
+        triggers a macOS "would like to access data from other apps"
+        permission prompt, which is extremely disruptive.
 
         Args:
             title: Notification title
             message: Notification message
         """
-        try:
-            script = f'display notification "{message}" with title "{title}"'
-            subprocess.run(
-                ["osascript", "-e", script],
-                check=False,
-                timeout=5
-            )
-            logger.debug("macOS notification sent via osascript")
-
-        except Exception as e:
-            logger.debug(f"osascript not available: {e}")
+        # If we have a tray icon, use it (already handled by caller).
+        # Otherwise just log — no osascript.
+        logger.debug(f"macOS notification (logged only): {title} — {message}")
 
     def _notify_windows(self, title: str, message: str, icon_type: str):
         """

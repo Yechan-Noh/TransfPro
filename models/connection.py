@@ -27,7 +27,7 @@ class ConnectionProfile:
         has_2fa: Whether two-factor authentication is required (default: False).
         two_fa_response: Response to send for 2FA approval (default: "1").
         two_fa_timeout: Seconds to wait for 2FA approval (default: 60).
-        remember_password: Whether to remember password in keyring (default: False).
+        remember_password: Whether to remember password locally (default: False).
         timeout: Connection timeout in seconds (default: 10).
         auto_reconnect: Whether to automatically reconnect on disconnection (default: True).
         keepalive_interval: SSH keepalive interval in seconds (default: 30).

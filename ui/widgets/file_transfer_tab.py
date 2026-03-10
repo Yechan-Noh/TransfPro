@@ -314,9 +314,20 @@ class FloatingTransferBox(QWidget):
         self._rows[transfer.task_id] = row
         self.rows_layout.addWidget(row)
 
+        # Coalesce layout recalculations — if many transfers are added in
+        # rapid succession, only the last one triggers resize/reposition.
+        if not hasattr(self, '_layout_timer'):
+            self._layout_timer = QTimer(self)
+            self._layout_timer.setSingleShot(True)
+            self._layout_timer.setInterval(50)
+            self._layout_timer.timeout.connect(self._deferred_layout)
+        self._layout_timer.start()  # restart if already running
+        self.show()
+
+    def _deferred_layout(self):
+        """Called once after a batch of add_transfer() calls finishes."""
         self._update_header()
         self._resize_to_fit()
-        self.show()
         self._reposition()
 
     def update_progress(self, task_id: str, bytes_done: int, bytes_total: int):
@@ -500,11 +511,16 @@ class FileTransferTab(QWidget):
     """The main file transfer tab — local + remote file browsers side by side
     with drag-and-drop, concurrency management, and progress tracking."""
 
-    def __init__(self, ssh_manager, sftp_manager, database, parent=None):
+    # Sync signals — MainWindow uses these to drive the Terminal tab
+    pane_connected = pyqtSignal(str, bool, object, object)    # side, is_remote, ssh_manager, profile
+    pane_disconnected = pyqtSignal(str)                        # side
+
+    def __init__(self, database, ssh_manager=None, sftp_manager=None, parent=None):
         super().__init__(parent)
+        self.database = database
+        # Legacy: kept for MainWindow compatibility but panes now manage their own
         self.ssh_manager = ssh_manager
         self.sftp_manager = sftp_manager
-        self.database = database
         self.transfer_threads: Dict[str, QThread] = {}
         self.transfer_workers: Dict[str, object] = {}
 
@@ -521,7 +537,7 @@ class FileTransferTab(QWidget):
         self._connect_signals()
 
     def _setup_ui(self):
-        """Build the split-pane layout: local browser + terminal | remote browser + terminal."""
+        """Build the split-pane layout: two file browsers + two terminals."""
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -529,12 +545,12 @@ class FileTransferTab(QWidget):
         # MAIN CONTENT — horizontal splitter, 50/50
         self.main_splitter = QSplitter(Qt.Horizontal)
 
-        # ── Left column: local file browser + local terminal ──
+        # ── Left column: file browser + terminal ──
         self.local_vsplitter = QSplitter(Qt.Vertical)
 
         self.local_pane = FileBrowserPane(
-            title="Local",
-            is_remote=False,
+            title="Left",
+            database=self.database,
             parent=self
         )
         self.local_vsplitter.addWidget(self.local_pane)
@@ -552,20 +568,18 @@ class FileTransferTab(QWidget):
 
         self.main_splitter.addWidget(self.local_vsplitter)
 
-        # ── Right column: remote file browser + remote terminal ──
+        # ── Right column: file browser + terminal ──
         self.remote_vsplitter = QSplitter(Qt.Vertical)
 
         self.remote_pane = FileBrowserPane(
-            title="Remote",
-            is_remote=True,
-            sftp_manager=self.sftp_manager,
+            title="Right",
+            database=self.database,
             parent=self
         )
         self.remote_vsplitter.addWidget(self.remote_pane)
 
         self.remote_terminal = MiniTerminal(
-            is_remote=True,
-            ssh_manager=self.ssh_manager,
+            is_remote=False,
             parent=self
         )
         self.remote_vsplitter.addWidget(self.remote_terminal)
@@ -598,97 +612,358 @@ class FileTransferTab(QWidget):
 
     def _connect_signals(self):
         """Wire up drag-and-drop, button clicks, and transfer queue signals."""
+        # Drag-and-drop: upload goes to remote pane's SFTP, download from remote pane's SFTP
         self.local_pane.transfer_upload_requested.connect(
-            lambda paths, target: self.upload_files(paths, target))
+            lambda paths, target: self.upload_files(
+                paths, target,
+                sftp=self.remote_pane.sftp_manager if self.remote_pane.is_remote else self.local_pane.sftp_manager,
+                refresh_pane=self.remote_pane if self.remote_pane.is_remote else self.local_pane))
         self.local_pane.transfer_download_requested.connect(
-            lambda paths, target: self.download_files(paths, target))
+            lambda paths, target: self.download_files(
+                paths, target,
+                sftp=self.remote_pane.sftp_manager if self.remote_pane.is_remote else self.local_pane.sftp_manager,
+                refresh_pane=self.local_pane))
         self.remote_pane.transfer_upload_requested.connect(
-            lambda paths, target: self.upload_files(paths, target))
+            lambda paths, target: self.upload_files(
+                paths, target,
+                sftp=self.local_pane.sftp_manager if self.local_pane.is_remote else self.remote_pane.sftp_manager,
+                refresh_pane=self.local_pane if self.local_pane.is_remote else self.remote_pane))
         self.remote_pane.transfer_download_requested.connect(
-            lambda paths, target: self.download_files(paths, target))
-        self.local_pane.transfer_button_clicked.connect(self._on_upload_clicked)
-        self.remote_pane.transfer_button_clicked.connect(self._on_download_clicked)
-        # Quick Transfer Macros — both panes emit the same signal
-        self.local_pane.transfer_macro_requested.connect(self._on_transfer_macro)
-        self.remote_pane.transfer_macro_requested.connect(self._on_transfer_macro)
+            lambda paths, target: self.download_files(
+                paths, target,
+                sftp=self.local_pane.sftp_manager if self.local_pane.is_remote else self.remote_pane.sftp_manager,
+                refresh_pane=self.remote_pane))
+        # Transfer button — determine direction dynamically
+        self.local_pane.transfer_button_clicked.connect(
+            lambda: self._on_transfer_clicked(self.local_pane, self.remote_pane))
+        self.remote_pane.transfer_button_clicked.connect(
+            lambda: self._on_transfer_clicked(self.remote_pane, self.local_pane))
+        # Quick Transfer Macros — each pane emits file list; lambda identifies source
+        self.local_pane.transfer_macro_requested.connect(
+            lambda files: self._on_transfer_macro(self.local_pane, self.remote_pane, files))
+        self.remote_pane.transfer_macro_requested.connect(
+            lambda files: self._on_transfer_macro(self.remote_pane, self.local_pane, files))
+        self.local_pane.open_remote_file_requested.connect(self._on_open_remote_file)
         self.remote_pane.open_remote_file_requested.connect(self._on_open_remote_file)
+        self.local_pane.open_remote_with_requested.connect(self._on_open_remote_with)
         self.remote_pane.open_remote_with_requested.connect(self._on_open_remote_with)
         # Keep mini-terminal cwd in sync when navigating the file browser
         self.local_pane.directory_changed.connect(self.local_terminal.cd)
         self.remote_pane.directory_changed.connect(self.remote_terminal.cd)
         self.transfer_queue.pause_requested.connect(self._on_pause_requested)
         self.transfer_queue.cancel_requested.connect(self._on_cancel_requested)
+        # Pane activation — connect/disconnect mini-terminals and sync profiles
+        self.local_pane.pane_activated.connect(
+            lambda is_remote: self._on_pane_activated(self.local_pane, self.local_terminal, is_remote))
+        self.remote_pane.pane_activated.connect(
+            lambda is_remote: self._on_pane_activated(self.remote_pane, self.remote_terminal, is_remote))
+        self.local_pane.pane_deactivated.connect(
+            lambda: self._on_pane_deactivated(self.local_pane, self.local_terminal))
+        self.remote_pane.pane_deactivated.connect(
+            lambda: self._on_pane_deactivated(self.remote_pane, self.remote_terminal))
+        # Profile sync: when one pane changes profiles, reload in the other
+        self.local_pane.get_connection_selector().profiles_changed.connect(
+            self.remote_pane.get_connection_selector().reload_profiles)
+        self.remote_pane.get_connection_selector().profiles_changed.connect(
+            self.local_pane.get_connection_selector().reload_profiles)
 
     # ── Button handlers ──
 
-    def _on_upload_clicked(self):
-        selected_paths = self.local_pane.get_selected_paths()
+    def _on_transfer_clicked(self, source_pane, dest_pane):
+        """Handle transfer button click — transfer selected files from source to dest pane."""
+        selected_paths = source_pane.get_selected_paths()
         if not selected_paths:
             QMessageBox.information(self, "No Files Selected",
-                                   "Please select files to upload")
+                                   "Please select files to transfer")
             return
-        self.upload_files(selected_paths, self.remote_pane.current_path)
 
-    def _on_download_clicked(self):
-        selected_paths = self.remote_pane.get_selected_paths()
-        if not selected_paths:
-            QMessageBox.information(self, "No Files Selected",
-                                   "Please select files to download")
+        # Determine the transfer direction based on pane types
+        src_remote = source_pane.is_remote
+        dst_remote = dest_pane.is_remote
+
+        if not src_remote and dst_remote:
+            # Local → Cluster = upload — refresh the dest (cluster) pane
+            self.upload_files(selected_paths, dest_pane.current_path,
+                              sftp=dest_pane.sftp_manager,
+                              refresh_pane=dest_pane)
+        elif src_remote and not dst_remote:
+            # Cluster → Local = download — refresh the dest (local) pane
+            self.download_files(selected_paths, dest_pane.current_path,
+                                sftp=source_pane.sftp_manager,
+                                refresh_pane=dest_pane)
+        elif not src_remote and not dst_remote:
+            # Local → Local = local copy (runs in background thread)
+            self._local_copy_async(selected_paths, dest_pane.current_path,
+                                   dest_pane)
+        elif src_remote and dst_remote:
+            # Cluster → Cluster = two-hop transfer
+            self._cluster_to_cluster_transfer(
+                selected_paths, source_pane, dest_pane
+            )
+
+    def _local_copy_async(self, paths, dest_dir, refresh_pane=None):
+        """Copy local files in a background thread to avoid freezing the UI."""
+        import shutil
+
+        def _do_copy():
+            errors = []
+            for p in paths:
+                name = os.path.basename(p)
+                dst = os.path.join(dest_dir, name)
+                try:
+                    if os.path.isdir(p):
+                        shutil.copytree(p, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(p, dst)
+                except Exception as e:
+                    logger.error(f"Local copy failed: {e}")
+                    errors.append((name, str(e)))
+            return errors
+
+        def _on_done(future):
+            try:
+                errors = future.result()
+            except Exception as e:
+                errors = [("(unknown)", str(e))]
+            # Schedule UI updates on the main thread via QTimer
+            from PyQt5.QtCore import QTimer
+            def _finish():
+                if errors:
+                    msg = "\n".join(f"{n}: {e}" for n, e in errors)
+                    QMessageBox.warning(self, "Copy Error",
+                                        f"Some files failed to copy:\n{msg}")
+                if refresh_pane:
+                    refresh_pane.refresh()
+            QTimer.singleShot(0, _finish)
+
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_do_copy)
+        future.add_done_callback(_on_done)
+        executor.shutdown(wait=False)
+
+    def _cluster_to_cluster_transfer(self, remote_paths, src_pane, dst_pane):
+        """Transfer files between two clusters via local temp dir.
+
+        Downloads from source cluster to a local temp dir, then uploads
+        to the destination cluster.  The upload is triggered automatically
+        when all downloads complete (see _check_c2c_completion).
+        """
+        tmp_dir = tempfile.mkdtemp(prefix="transfpro_c2c_")
+        # Track which transfer IDs belong to this c2c batch
+        self._c2c_pending = {
+            'tmp_dir': tmp_dir,
+            'remote_paths': remote_paths,
+            'dst_pane': dst_pane,
+            'download_ids': set(),
+            'upload_started': False,
+        }
+
+        # Download from source cluster to temp — no pane refresh needed
+        self.download_files(
+            remote_paths, tmp_dir,
+            sftp=src_pane.sftp_manager,
+            refresh_pane=None  # Don't refresh any pane for the download leg
+        )
+
+        # Collect the transfer IDs that were just enqueued
+        # They're the most recent entries in the transfer_box
+        for tid, t in self.transfer_box.transfers.items():
+            if t.status in ("pending", "in_progress") and not t.is_upload:
+                if t.destination_path.startswith(tmp_dir):
+                    self._c2c_pending['download_ids'].add(tid)
+
+    def _check_c2c_completion(self, completed_id: str):
+        """Check if all c2c downloads finished and trigger the upload leg."""
+        c2c = getattr(self, '_c2c_pending', None)
+        if not c2c or c2c.get('upload_started'):
             return
-        self.download_files(selected_paths, self.local_pane.current_path)
 
-    def _on_transfer_macro(self, local_path: str, remote_path: str, direction: str):
-        """Execute a quick transfer macro."""
-        if direction == 'upload':
-            self.upload_files([local_path], remote_path)
+        # Remove the completed ID from pending downloads
+        c2c['download_ids'].discard(completed_id)
+
+        # Check if all downloads are done
+        if c2c['download_ids']:
+            return  # Still waiting for more downloads
+
+        # All downloads complete — upload from temp dir to dest cluster
+        c2c['upload_started'] = True
+        tmp_dir = c2c['tmp_dir']
+        dst_pane = c2c['dst_pane']
+
+        # Collect the files that were downloaded to tmp_dir
+        local_files = []
+        try:
+            for entry in os.scandir(tmp_dir):
+                local_files.append(entry.path)
+        except Exception as e:
+            logger.error(f"C2C: failed to list temp dir {tmp_dir}: {e}")
+            self._c2c_pending = None
+            return
+
+        if local_files and dst_pane.sftp_manager:
+            self.upload_files(
+                local_files, dst_pane.current_path,
+                sftp=dst_pane.sftp_manager,
+                refresh_pane=dst_pane
+            )
+
+        self._c2c_pending = None
+
+    def _on_transfer_macro(self, src_pane, dst_pane, file_names: list):
+        """Execute a quick transfer macro.
+
+        Resolves *file_names* against *src_pane*'s current directory and
+        transfers them to *dst_pane*'s current directory.
+        """
+        import posixpath, os
+
+        # Build full source paths
+        src_dir = src_pane.current_path
+        dst_dir = dst_pane.current_path
+
+        if not src_dir or not dst_dir:
+            QMessageBox.warning(self, "Macro Error",
+                                "Both panes must have a current directory.")
+            return
+
+        # Need an SFTP manager for any remote side
+        sftp = None
+        for pane in (src_pane, dst_pane):
+            if pane.is_remote and pane.sftp_manager:
+                sftp = pane.sftp_manager
+                break
+        if not sftp:
+            # Both local — use simple file copy (no SFTP needed)
+            pass
+
+        # Build full source paths (use posixpath for remote, os.path for local)
+        if src_pane.is_remote:
+            src_paths = [posixpath.join(src_dir, f) for f in file_names]
         else:
-            self.download_files([remote_path], local_path)
+            src_paths = [os.path.join(src_dir, f) for f in file_names]
+
+        # Determine transfer direction
+        if src_pane.is_remote and not dst_pane.is_remote:
+            # Download: remote → local
+            self.download_files(src_paths, dst_dir, sftp=sftp,
+                                refresh_pane=dst_pane)
+        elif not src_pane.is_remote and dst_pane.is_remote:
+            # Upload: local → remote
+            self.upload_files(src_paths, dst_dir, sftp=sftp,
+                              refresh_pane=dst_pane)
+        else:
+            # Both local or both remote — not a typical transfer
+            QMessageBox.warning(self, "Macro Error",
+                                "Macro transfer requires one local and one "
+                                "remote pane.")
+
+    # ── Pane activation handlers ──
+
+    def _on_pane_activated(self, pane, terminal, is_remote):
+        """A pane connected to Local or Cluster — set up its mini-terminal."""
+        if is_remote and pane.ssh_manager:
+            terminal.is_remote = True
+            terminal.ssh_manager = pane.ssh_manager
+            terminal.connect_terminal()
+        else:
+            terminal.is_remote = False
+            terminal.ssh_manager = None
+            terminal.connect_terminal()
+
+        # Notify MainWindow so it can sync the Terminal tab
+        side = "left" if pane is self.local_pane else "right"
+        self.pane_connected.emit(
+            side, is_remote,
+            pane.ssh_manager,        # None for local
+            pane.connected_profile,  # None for local
+        )
+
+    def _on_pane_deactivated(self, pane, terminal):
+        """A pane disconnected — disconnect its mini-terminal."""
+        try:
+            terminal.disconnect_terminal()
+        except Exception as e:
+            logger.debug(f"Error disconnecting terminal: {e}")
+        try:
+            terminal.display.clear()
+        except Exception:
+            pass
+
+        side = "left" if pane is self.local_pane else "right"
+        self.pane_disconnected.emit(side)
 
     # ── Transfer logic ──
 
-    def upload_files(self, local_paths: List[str], remote_dir: str):
+    def _get_sftp(self, sftp=None):
+        """Return the SFTP manager to use for a transfer."""
+        if sftp:
+            return sftp
+        # Legacy fallback: check panes for an active SFTP connection
+        for pane in (self.local_pane, self.remote_pane):
+            if pane.is_remote and pane.sftp_manager:
+                return pane.sftp_manager
+        return self.sftp_manager  # last resort: shared manager
+
+    # How many transfers to enqueue per event-loop tick (keeps UI responsive)
+    _ENQUEUE_BATCH_SIZE = 3
+
+    def upload_files(self, local_paths: List[str], remote_dir: str, sftp=None,
+                     refresh_pane=None):
         """Upload files and directories.
 
         Each path becomes a single transfer task — directories are handled
         entirely in the worker thread (walking, mkdir, uploading) so the
         UI never freezes.
+
+        Enqueuing is done in small batches via QTimer so the event loop can
+        process repaints between groups, keeping the mouse responsive.
+
+        Args:
+            local_paths: Local file/directory paths to upload.
+            remote_dir: Remote destination directory.
+            sftp: Specific SFTPManager to use (otherwise auto-detected).
+            refresh_pane: Pane to refresh on completion (otherwise remote_pane).
         """
         logger.info(f"upload_files called: {len(local_paths)} paths -> {remote_dir}")
         if not local_paths:
             return
 
-        if not self.sftp_manager:
+        resolved_sftp = self._get_sftp(sftp)
+        if not resolved_sftp:
             QMessageBox.warning(self, "Not Connected",
                                 "SFTP is not available. Please connect first.")
             return
 
+        # Build the work list then drain it in small batches
+        pending = [
+            (lp, f"{remote_dir}/{os.path.basename(lp)}", os.path.basename(lp))
+            for lp in local_paths
+        ]
+        self._drain_upload_batch(pending, resolved_sftp, refresh_pane)
+
+    def _drain_upload_batch(self, pending, sftp, refresh_pane):
+        """Enqueue up to _ENQUEUE_BATCH_SIZE uploads, then yield to the
+        event loop before processing the next batch."""
+        batch = pending[:self._ENQUEUE_BATCH_SIZE]
+        remaining = pending[self._ENQUEUE_BATCH_SIZE:]
         try:
-            valid_paths = [p for p in local_paths if os.path.exists(p)]
-            if not valid_paths:
-                QMessageBox.warning(self, "Error", "No valid files to upload")
-                return
-
-            for local_path in valid_paths:
-                filename = os.path.basename(local_path)
-
-                if os.path.isdir(local_path):
-                    # Directory → single task; worker handles everything
-                    self._enqueue_single_upload(
-                        local_path, f"{remote_dir}/{filename}",
-                        f"{filename}/", 0  # total_bytes computed by worker
-                    )
-                else:
-                    file_size = os.path.getsize(local_path)
-                    self._enqueue_single_upload(
-                        local_path, f"{remote_dir}/{filename}",
-                        filename, file_size
-                    )
+            for local_path, remote_path, filename in batch:
+                self._enqueue_single_upload(
+                    local_path, remote_path, filename, 0,
+                    sftp=sftp, refresh_pane=refresh_pane
+                )
         except Exception as e:
             logger.error(f"Upload error: {e}")
             QMessageBox.critical(self, "Upload Error", str(e))
+            return
+        if remaining:
+            QTimer.singleShot(0, lambda: self._drain_upload_batch(
+                remaining, sftp, refresh_pane))
 
     def _enqueue_single_upload(self, local_path: str, remote_path: str,
-                               display_name: str, file_size: int):
+                               display_name: str, file_size: int,
+                               sftp=None, refresh_pane=None):
         """Create a TransferTask for a single file or directory upload."""
         transfer_id = str(uuid.uuid4())
         transfer = TransferTask(
@@ -699,24 +974,37 @@ class FileTransferTab(QWidget):
         )
         self.transfer_queue.add_transfer(transfer)
         self.transfer_box.add_transfer(transfer)
-        self._enqueue_transfer(transfer_id, "upload", local_path, remote_path)
+        self._enqueue_transfer(transfer_id, "upload", local_path, remote_path,
+                               sftp=sftp, refresh_pane=refresh_pane)
 
-    def download_files(self, remote_paths: List[str], local_dir: str):
+    def download_files(self, remote_paths: List[str], local_dir: str, sftp=None,
+                       refresh_pane=None):
         """Download files and directories.
 
         Stats all remote paths in a background thread to avoid freezing the
         UI, then enqueues each as a single transfer task.
+
+        Args:
+            remote_paths: Remote file/directory paths to download.
+            local_dir: Local destination directory.
+            sftp: Specific SFTPManager to use (otherwise auto-detected).
+            refresh_pane: Pane to refresh on completion (otherwise local_pane).
         """
         if not remote_paths:
             return
 
-        if not self.sftp_manager:
+        resolved_sftp = self._get_sftp(sftp)
+        if not resolved_sftp:
             QMessageBox.warning(self, "Not Connected",
                                 "SFTP is not available. Please connect first.")
             return
 
+        # Store the resolved SFTP and refresh pane for use in the callback
+        self._download_sftp = resolved_sftp
+        self._download_refresh_pane = refresh_pane
+
         # Run stat calls in background so the UI stays responsive
-        worker = _DownloadStatWorker(self.sftp_manager, remote_paths, local_dir)
+        worker = _DownloadStatWorker(resolved_sftp, remote_paths, local_dir)
         thread = QThread()
         worker.moveToThread(thread)
 
@@ -734,28 +1022,45 @@ class FileTransferTab(QWidget):
     def _on_download_stats_ready(self, results: list, local_dir: str):
         """Called on the main thread after background stat calls finish.
 
-        Enqueues one transfer task per path, now that we know file sizes
-        and which paths are directories.
+        Enqueues one transfer task per path in small batches so the event
+        loop stays responsive when many files are queued at once.
         """
+        resolved_sftp = getattr(self, '_download_sftp', None)
+        refresh_pane = getattr(self, '_download_refresh_pane', None)
+
+        # Build a work list of (remote_path, local_path, display_name, size)
+        pending = []
+        for remote_path, is_dir, file_size, filename in results:
+            local_path = os.path.join(local_dir, filename)
+            if is_dir:
+                pending.append((remote_path, local_path, f"{filename}/", 0))
+            else:
+                pending.append((remote_path, local_path, filename, file_size))
+
+        self._drain_download_batch(pending, resolved_sftp, refresh_pane)
+
+    def _drain_download_batch(self, pending, sftp, refresh_pane):
+        """Enqueue up to _ENQUEUE_BATCH_SIZE downloads, then yield to the
+        event loop before processing the next batch."""
+        batch = pending[:self._ENQUEUE_BATCH_SIZE]
+        remaining = pending[self._ENQUEUE_BATCH_SIZE:]
         try:
-            for remote_path, is_dir, file_size, filename in results:
-                if is_dir:
-                    local_path = os.path.join(local_dir, filename)
-                    self._enqueue_single_download(
-                        remote_path, local_path,
-                        f"{filename}/", 0  # total_bytes computed by worker
-                    )
-                else:
-                    local_path = os.path.join(local_dir, filename)
-                    self._enqueue_single_download(
-                        remote_path, local_path, filename, file_size
-                    )
+            for remote_path, local_path, display_name, file_size in batch:
+                self._enqueue_single_download(
+                    remote_path, local_path, display_name, file_size,
+                    sftp=sftp, refresh_pane=refresh_pane
+                )
         except Exception as e:
             logger.error(f"Download error: {e}")
             QMessageBox.critical(self, "Download Error", str(e))
+            return
+        if remaining:
+            QTimer.singleShot(0, lambda: self._drain_download_batch(
+                remaining, sftp, refresh_pane))
 
     def _enqueue_single_download(self, remote_path: str, local_path: str,
-                                 display_name: str, file_size: int):
+                                 display_name: str, file_size: int,
+                                 sftp=None, refresh_pane=None):
         """Create a TransferTask for a single file or directory download."""
         transfer_id = str(uuid.uuid4())
         transfer = TransferTask(
@@ -766,47 +1071,62 @@ class FileTransferTab(QWidget):
         )
         self.transfer_queue.add_transfer(transfer)
         self.transfer_box.add_transfer(transfer)
-        self._enqueue_transfer(transfer_id, "download", local_path, remote_path)
+        self._enqueue_transfer(transfer_id, "download", local_path, remote_path,
+                               sftp=sftp, refresh_pane=refresh_pane)
 
     # ── Concurrency management ──
 
     def _enqueue_transfer(self, transfer_id: str, direction: str,
-                          local_path: str, remote_path: str):
+                          local_path: str, remote_path: str,
+                          sftp=None, refresh_pane=None):
         """Start transfer immediately if under limit, otherwise queue it."""
         if self._active_count < self._max_concurrent:
-            self._launch_transfer(transfer_id, direction, local_path, remote_path)
+            self._launch_transfer(transfer_id, direction, local_path, remote_path,
+                                  sftp=sftp, refresh_pane=refresh_pane)
         else:
-            self._pending_starts.append((transfer_id, direction, local_path, remote_path))
+            self._pending_starts.append(
+                (transfer_id, direction, local_path, remote_path, sftp, refresh_pane)
+            )
             logger.debug(
                 f"Transfer {transfer_id} queued ({self._active_count} active, "
                 f"{len(self._pending_starts)} pending)"
             )
 
     def _launch_transfer(self, transfer_id: str, direction: str,
-                         local_path: str, remote_path: str):
+                         local_path: str, remote_path: str,
+                         sftp=None, refresh_pane=None):
         """Actually start a transfer worker."""
         self._active_count += 1
         if direction == "upload":
-            self._start_upload_worker(transfer_id, local_path, remote_path)
+            self._start_upload_worker(transfer_id, local_path, remote_path,
+                                      sftp=sftp, refresh_pane=refresh_pane)
         else:
-            self._start_download_worker(transfer_id, remote_path, local_path)
+            self._start_download_worker(transfer_id, remote_path, local_path,
+                                        sftp=sftp, refresh_pane=refresh_pane)
 
     def _start_next_pending(self):
         """Start the next pending transfer if a slot is available."""
         while self._pending_starts and self._active_count < self._max_concurrent:
-            transfer_id, direction, local_path, remote_path = self._pending_starts.pop(0)
+            entry = self._pending_starts.pop(0)
+            transfer_id, direction, local_path, remote_path = entry[:4]
+            sftp = entry[4] if len(entry) > 4 else None
+            refresh_pane = entry[5] if len(entry) > 5 else None
             # Skip if already cancelled while waiting
             if transfer_id in self.transfer_queue.transfers:
                 t = self.transfer_queue.transfers[transfer_id]
                 if t.status == "cancelled":
                     continue
-            self._launch_transfer(transfer_id, direction, local_path, remote_path)
+            self._launch_transfer(transfer_id, direction, local_path, remote_path,
+                                  sftp=sftp, refresh_pane=refresh_pane)
 
-    def _start_upload_worker(self, transfer_id: str, local_path: str, remote_path: str):
+    def _start_upload_worker(self, transfer_id: str, local_path: str, remote_path: str,
+                             sftp=None, refresh_pane=None):
         """Spin up a background thread for a single file upload."""
         try:
-            # Get file size for the model task
-            file_size = os.path.getsize(local_path) if os.path.isfile(local_path) else 0
+            # Don't stat the file here — the worker thread will determine the
+            # actual size when it starts.  Keeping the main thread free avoids
+            # freezing the UI on slow file systems.
+            file_size = 0
 
             # Create the models/transfer.TransferTask for TransferWorker
             model_task = ModelTransferTask(
@@ -817,16 +1137,22 @@ class FileTransferTab(QWidget):
                 id=transfer_id,
             )
 
+            # Use the explicitly provided SFTP, or fall back to auto-detect
+            use_sftp = sftp or self._get_sftp()
+
             # Create worker and thread
-            worker = TransferWorker(self.sftp_manager, model_task)
+            worker = TransferWorker(use_sftp, model_task)
             thread = QThread()
             worker.moveToThread(thread)
 
             # Connect worker signals to UI updates
             worker.progress.connect(self._on_transfer_progress)
             worker.speed_updated.connect(self._on_transfer_speed)
+            # Refresh the correct pane on completion
+            _refresh = refresh_pane
             worker.transfer_completed.connect(
-                lambda tid, success: self._on_transfer_done(tid, success, refresh_remote=True)
+                lambda tid, success: self._on_transfer_done(
+                    tid, success, refresh_pane=_refresh)
             )
             worker.transfer_started.connect(self._on_transfer_started)
 
@@ -845,16 +1171,18 @@ class FileTransferTab(QWidget):
             self.transfer_queue.mark_completed(transfer_id, False)
             self.transfer_box.mark_completed(transfer_id, False)
 
-    def _start_download_worker(self, transfer_id: str, remote_path: str, local_path: str):
+    def _start_download_worker(self, transfer_id: str, remote_path: str, local_path: str,
+                               sftp=None, refresh_pane=None):
         """Spin up a background thread for a single file download."""
         try:
-            # Get file size from remote
+            # Use the explicitly provided SFTP, or fall back to auto-detect
+            use_sftp = sftp or self._get_sftp()
+
+            # Don't stat the remote file here — the _DownloadStatWorker
+            # already retrieved sizes, and the worker thread will handle
+            # any remaining unknowns.  Avoids blocking the main thread
+            # with an SFTP round-trip.
             file_size = 0
-            try:
-                metadata = self.sftp_manager.get_file_info(remote_path)
-                file_size = metadata.size if metadata else 0
-            except Exception:
-                pass
 
             # Create the models/transfer.TransferTask for TransferWorker
             model_task = ModelTransferTask(
@@ -866,15 +1194,18 @@ class FileTransferTab(QWidget):
             )
 
             # Create worker and thread
-            worker = TransferWorker(self.sftp_manager, model_task)
+            worker = TransferWorker(use_sftp, model_task)
             thread = QThread()
             worker.moveToThread(thread)
 
             # Connect worker signals to UI updates
             worker.progress.connect(self._on_transfer_progress)
             worker.speed_updated.connect(self._on_transfer_speed)
+            # Refresh the correct pane on completion
+            _refresh = refresh_pane
             worker.transfer_completed.connect(
-                lambda tid, success: self._on_transfer_done(tid, success, refresh_remote=False)
+                lambda tid, success: self._on_transfer_done(
+                    tid, success, refresh_pane=_refresh)
             )
             worker.transfer_started.connect(self._on_transfer_started)
 
@@ -926,23 +1257,32 @@ class FileTransferTab(QWidget):
         self.transfer_queue.update_speed(transfer_id, speed_bps)
         self.transfer_box.update_speed(transfer_id, speed_bps)
 
-    def _on_transfer_done(self, transfer_id: str, success: bool, refresh_remote: bool = True):
+    def _on_transfer_done(self, transfer_id: str, success: bool,
+                          refresh_pane=None):
         """Called when a transfer finishes. Don't touch thread/worker refs here —
         the thread is still winding down. Actual cleanup happens in
-        _cleanup_transfer_thread once thread.finished fires."""
+        _cleanup_transfer_thread once thread.finished fires.
+
+        Args:
+            transfer_id: ID of the completed transfer.
+            success: Whether the transfer succeeded.
+            refresh_pane: Specific pane to refresh, or None for no auto-refresh.
+        """
         self.transfer_queue.mark_completed(transfer_id, success)
         self.transfer_box.mark_completed(transfer_id, success)
 
         # Refresh the appropriate pane
-        if success:
-            if refresh_remote:
-                self.remote_pane.refresh()
-            else:
-                self.local_pane.refresh()
+        if success and refresh_pane is not None:
+            refresh_pane.refresh()
+
+        # Check for pending cluster-to-cluster uploads
+        if success and hasattr(self, '_c2c_pending') and self._c2c_pending:
+            self._check_c2c_completion(transfer_id)
 
     def _on_open_remote_file(self, remote_path: str):
         """Download a remote file to /tmp and open it with the default app."""
-        if not self.sftp_manager:
+        sftp = self._get_sftp()
+        if not sftp:
             QMessageBox.warning(self, "Not Connected",
                                 "SFTP is not available. Please connect first.")
             return
@@ -959,12 +1299,9 @@ class FileTransferTab(QWidget):
         # Start a download that opens the file on completion
         transfer_id = str(uuid.uuid4())
 
+        # Don't stat the remote file here — let the worker thread handle
+        # it to avoid blocking the main thread with an SFTP round-trip.
         file_size = 0
-        try:
-            metadata = self.sftp_manager.get_file_info(remote_path)
-            file_size = metadata.size if metadata else 0
-        except Exception as e:
-            logger.debug(f"Could not stat {remote_path}: {e}")
 
         transfer = TransferTask(
             task_id=transfer_id, filename=filename,
@@ -985,7 +1322,7 @@ class FileTransferTab(QWidget):
             id=transfer_id,
         )
 
-        worker = TransferWorker(self.sftp_manager, model_task)
+        worker = TransferWorker(sftp, model_task)
         thread = QThread()
         worker.moveToThread(thread)
 
@@ -995,7 +1332,7 @@ class FileTransferTab(QWidget):
 
         # On completion, open the file if successful
         def on_open_transfer_done(tid, success):
-            self._on_transfer_done(tid, success, refresh_remote=False)
+            self._on_transfer_done(tid, success)
             if success:
                 self._open_file_locally(local_path)
 
@@ -1012,19 +1349,18 @@ class FileTransferTab(QWidget):
         thread.start()
 
     def _open_file_locally(self, local_path: str):
-        """Open a file with the OS default app (macOS 'open', Linux 'xdg-open')."""
+        """Open a file with the OS default app (non-blocking)."""
         try:
             if sys.platform == 'darwin':
-                # Try 'open' first — if no app is registered, it returns non-zero
-                result = subprocess.run(
-                    ['open', local_path],
-                    capture_output=True, timeout=5
-                )
-                if result.returncode != 0:
-                    # Fallback: open with TextEdit for unrecognized file types
-                    subprocess.Popen(['open', '-a', 'TextEdit', local_path])
+                # Use Popen (non-blocking) instead of subprocess.run which
+                # can block the main thread for up to the timeout duration.
+                subprocess.Popen(['open', local_path],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
             elif sys.platform.startswith('linux'):
-                subprocess.Popen(['xdg-open', local_path])
+                subprocess.Popen(['xdg-open', local_path],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
             else:
                 os.startfile(local_path)
         except Exception as e:
@@ -1033,7 +1369,8 @@ class FileTransferTab(QWidget):
 
     def _on_open_remote_with(self, remote_path: str, app_path: str):
         """Download a remote file to temp and open it with a specific app."""
-        if not self.sftp_manager:
+        sftp = self._get_sftp()
+        if not sftp:
             QMessageBox.warning(self, "Not Connected",
                                 "SFTP is not available. Please connect first.")
             return
@@ -1048,12 +1385,9 @@ class FileTransferTab(QWidget):
 
         transfer_id = str(uuid.uuid4())
 
+        # Don't stat the remote file here — let the worker thread handle
+        # it to avoid blocking the main thread with an SFTP round-trip.
         file_size = 0
-        try:
-            metadata = self.sftp_manager.get_file_info(remote_path)
-            file_size = metadata.size if metadata else 0
-        except Exception as e:
-            logger.debug(f"Could not stat {remote_path}: {e}")
 
         transfer = TransferTask(
             task_id=transfer_id, filename=filename,
@@ -1073,7 +1407,7 @@ class FileTransferTab(QWidget):
             id=transfer_id,
         )
 
-        worker = TransferWorker(self.sftp_manager, model_task)
+        worker = TransferWorker(sftp, model_task)
         thread = QThread()
         worker.moveToThread(thread)
 
@@ -1082,7 +1416,7 @@ class FileTransferTab(QWidget):
         worker.transfer_started.connect(self._on_transfer_started)
 
         def on_open_with_done(tid, success):
-            self._on_transfer_done(tid, success, refresh_remote=False)
+            self._on_transfer_done(tid, success)
             if success:
                 self._open_file_with_app(local_path, app_path)
 

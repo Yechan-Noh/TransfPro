@@ -35,13 +35,13 @@ class TestSFTPConstants(unittest.TestCase):
     """Test SFTP performance tuning constants."""
 
     def test_window_size(self):
-        self.assertEqual(constants.SFTP_WINDOW_SIZE, 2 * 1024 * 1024)
+        self.assertEqual(constants.SFTP_WINDOW_SIZE, 4 * 1024 * 1024)
 
     def test_max_packet_size(self):
-        self.assertEqual(constants.SFTP_MAX_PACKET_SIZE, 64 * 1024)
+        self.assertEqual(constants.SFTP_MAX_PACKET_SIZE, 256 * 1024)
 
     def test_max_read_size(self):
-        self.assertEqual(constants.SFTP_MAX_READ_SIZE, 64 * 1024)
+        self.assertEqual(constants.SFTP_MAX_READ_SIZE, 256 * 1024)
 
     def test_operation_timeout_positive(self):
         self.assertGreater(constants.SFTP_OPERATION_TIMEOUT, 0)

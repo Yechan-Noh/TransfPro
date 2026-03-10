@@ -37,7 +37,7 @@ from transfpro.config.constants import APP_VERSION
 from transfpro.config.themes import DARK_THEME_QSS, LIGHT_THEME_QSS, scale_theme
 
 # Import UI components
-from transfpro.ui.widgets.connection_tab import ConnectionTab
+# ConnectionTab removed — connection is now handled per-pane in FileTransferTab
 # Lazy-imported when tabs are first accessed:
 # from transfpro.ui.widgets.job_manager_tab import JobManagerTab
 # from transfpro.ui.widgets.file_transfer_tab import FileTransferTab
@@ -150,22 +150,18 @@ class MainWindow(QMainWindow):
         # ── View ──
         view_menu = menubar.addMenu("&View")
 
-        # Tab navigation
-        conn_tab_action = view_menu.addAction("&Connections")
-        conn_tab_action.setShortcut("Ctrl+1")
-        conn_tab_action.triggered.connect(lambda: self._switch_tab(0))
-
+        # Tab navigation (Connection tab removed — File Transfer is now tab 0)
         files_tab_action = view_menu.addAction("&File Transfer")
-        files_tab_action.setShortcut("Ctrl+2")
-        files_tab_action.triggered.connect(lambda: self._switch_tab(1))
+        files_tab_action.setShortcut("Ctrl+1")
+        files_tab_action.triggered.connect(lambda: self._switch_tab(0))
 
         terminal_tab_action = view_menu.addAction("&Terminal")
-        terminal_tab_action.setShortcut("Ctrl+3")
-        terminal_tab_action.triggered.connect(lambda: self._switch_tab(2))
+        terminal_tab_action.setShortcut("Ctrl+2")
+        terminal_tab_action.triggered.connect(lambda: self._switch_tab(1))
 
         monitor_tab_action = view_menu.addAction("&Monitoring")
-        monitor_tab_action.setShortcut("Ctrl+4")
-        monitor_tab_action.triggered.connect(lambda: self._switch_tab(3))
+        monitor_tab_action.setShortcut("Ctrl+3")
+        monitor_tab_action.triggered.connect(lambda: self._switch_tab(2))
 
         view_menu.addSeparator()
 
@@ -199,15 +195,20 @@ class MainWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabPosition(QTabWidget.North)
 
-        # Connection tab — created immediately (needed at startup)
-        self.tabs['connection'] = ConnectionTab(self.ssh_manager, self.database)
-        self.tab_widget.addTab(self.tabs['connection'], "Connection")
+        # File Transfer tab — created immediately (it IS the main view now)
+        from transfpro.ui.widgets.file_transfer_tab import FileTransferTab
+        ft = FileTransferTab(
+            database=self.database,
+            ssh_manager=self.ssh_manager,
+            sftp_manager=self.sftp_manager,
+            parent=self
+        )
+        self.tabs['file_transfer'] = ft
+        self.tab_widget.addTab(ft, "File Transfer")
 
         # ── Lazy tab placeholders (created on first access) ──
-        # (internal_name, display_label) — internal_name is used for lazy-loading logic
         self._lazy_tab_indices = {}
         _tab_defs = [
-            ("File Transfer", "File Transfer"),
             ("Terminal", "Terminal"),
             ("Job Manager", "Monitoring"),
         ]
@@ -290,14 +291,21 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         """Connect signals between components."""
-        # Connection tab signals (always available at startup)
-        if 'connection' in self.tabs:
-            self.tabs['connection'].connection_changed.connect(
-                self._on_connection_changed
-            )
-            self.tabs['connection'].profile_changed.connect(
-                self._on_profile_changed
-            )
+        # File Transfer tab signals (always available at startup)
+        ft = self.tabs.get('file_transfer')
+        if ft:
+            if hasattr(ft, 'transfer_started'):
+                ft.transfer_started.connect(self._on_transfer_started)
+            if hasattr(ft, 'transfer_completed'):
+                ft.transfer_completed.connect(self._on_transfer_completed)
+
+            # Sync File Transfer ↔ Terminal tab connections
+            ft.pane_connected.connect(self._on_ft_pane_connected)
+            ft.pane_disconnected.connect(self._on_ft_pane_disconnected)
+
+        # Queued sync requests for when tabs aren't loaded yet
+        self._pending_terminal_syncs: dict = {}   # side → (is_remote, ssh_mgr, profile)
+        self._pending_monitor_syncs: dict = {}    # side → (ssh_mgr, profile)
 
         # Other tab signals are connected in _connect_lazy_tab_signals()
         # when each tab is first accessed
@@ -402,21 +410,27 @@ class MainWindow(QMainWindow):
             return f'font-size: {scaled}{unit}'
 
         for child in self.findChildren(QWidget):
-            ss = child.styleSheet()
-            if ss and _FS_RE.search(ss):
-                scaled_ss = _FS_RE.sub(_scale, ss)
-                if scaled_ss != ss:
-                    child.setStyleSheet(scaled_ss)
+            try:
+                ss = child.styleSheet()
+                if ss and _FS_RE.search(ss):
+                    scaled_ss = _FS_RE.sub(_scale, ss)
+                    if scaled_ss != ss:
+                        child.setStyleSheet(scaled_ss)
+            except RuntimeError:
+                pass  # Widget deleted during iteration
 
     # Slot methods for menu actions
 
     @pyqtSlot()
     def _on_new_connection(self):
-        """Handle new connection action."""
-        if 'connection' in self.tabs:
-            self.tab_widget.setCurrentWidget(self.tabs['connection'])
-            if hasattr(self.tabs['connection'], '_on_new_connection'):
-                self.tabs['connection']._on_new_connection()
+        """Handle new connection action — open connection dialog from file transfer pane."""
+        ft = self.tabs.get('file_transfer')
+        if ft:
+            self.tab_widget.setCurrentWidget(ft)
+            # Open connection dialog via the left pane's selector
+            selector = ft.local_pane.get_connection_selector()
+            if selector:
+                selector._on_new_connection()
 
     @pyqtSlot()
     def _on_settings(self):
@@ -466,10 +480,9 @@ class MainWindow(QMainWindow):
             "<tr><td><b>Ctrl+,</b></td><td>Preferences</td></tr>"
             "<tr><td><b>Ctrl+Q</b></td><td>Quit</td></tr>"
             "<tr><td colspan='2'><hr></td></tr>"
-            "<tr><td><b>Ctrl+1</b></td><td>Connections tab</td></tr>"
-            "<tr><td><b>Ctrl+2</b></td><td>File Transfer tab</td></tr>"
-            "<tr><td><b>Ctrl+3</b></td><td>Terminal tab</td></tr>"
-            "<tr><td><b>Ctrl+4</b></td><td>Monitoring tab</td></tr>"
+            "<tr><td><b>Ctrl+1</b></td><td>File Transfer tab</td></tr>"
+            "<tr><td><b>Ctrl+2</b></td><td>Terminal tab</td></tr>"
+            "<tr><td><b>Ctrl+3</b></td><td>Monitoring tab</td></tr>"
             "<tr><td colspan='2'><hr></td></tr>"
             "<tr><td><b>Ctrl+R</b></td><td>Refresh All</td></tr>"
             "</table>"
@@ -486,7 +499,12 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(bool)
     def _on_connection_changed(self, connected: bool):
-        """Handle connection status change."""
+        """Handle connection status change.
+
+        Note: With the unified file transfer UI, each pane manages its own
+        SSH/SFTP connection independently.  This method is kept for legacy
+        compatibility and status-bar updates only.
+        """
         if connected:
             self.status_widgets['connection'].setText("  Connected")
             self.status_widgets['connection'].setStyleSheet(
@@ -494,51 +512,6 @@ class MainWindow(QMainWindow):
                 "margin-right: 20px; letter-spacing: 0.3px;"
             )
             logger.info("SSH connection established")
-
-            # Enable other tabs
-            for tab_name in ['job_manager', 'file_transfer', 'terminal']:
-                if tab_name in self.tabs:
-                    self.tab_widget.setTabEnabled(
-                        self.tab_widget.indexOf(self.tabs[tab_name]),
-                        True
-                    )
-
-            # Trigger remote file browser refresh
-            if 'file_transfer' in self.tabs:
-                try:
-                    ft = self.tabs['file_transfer']
-                    if hasattr(ft, 'remote_pane'):
-                        ft.remote_pane.refresh()
-                        logger.info("Remote file browser refreshed after connection")
-                except Exception as e:
-                    logger.error(f"Error refreshing remote file browser: {e}")
-
-            # Trigger job manager refresh
-            if 'job_manager' in self.tabs:
-                try:
-                    self.tabs['job_manager'].refresh_jobs()
-                    logger.info("Job manager refreshed after connection")
-                except Exception as e:
-                    logger.error(f"Error refreshing job manager: {e}")
-
-            # Auto-connect terminal
-            if 'terminal' in self.tabs:
-                try:
-                    self.tabs['terminal'].connect_terminal()
-                except Exception as e:
-                    logger.error(f"Error connecting terminal: {e}")
-
-            # Auto-connect mini-terminals in file transfer tab
-            if 'file_transfer' in self.tabs:
-                ft = self.tabs['file_transfer']
-                try:
-                    if hasattr(ft, 'local_terminal'):
-                        ft.local_terminal.connect_terminal()
-                    if hasattr(ft, 'remote_terminal'):
-                        ft.remote_terminal.connect_terminal()
-                except Exception as e:
-                    logger.error(f"Error connecting mini-terminals: {e}")
-
         else:
             self.status_widgets['connection'].setText("  Not Connected")
             self.status_widgets['connection'].setStyleSheet(
@@ -546,42 +519,6 @@ class MainWindow(QMainWindow):
                 "margin-right: 20px; letter-spacing: 0.3px;"
             )
             logger.info("SSH connection lost")
-
-            # Disable other tabs
-            for tab_name in ['job_manager', 'file_transfer', 'terminal']:
-                if tab_name in self.tabs:
-                    self.tab_widget.setTabEnabled(
-                        self.tab_widget.indexOf(self.tabs[tab_name]),
-                        False
-                    )
-
-            # Disconnect and clear terminal
-            if 'terminal' in self.tabs:
-                try:
-                    term = self.tabs['terminal']
-                    term.disconnect_terminal()
-                    # Clear terminal output so stale content doesn't show
-                    # when reconnecting to a different server
-                    if hasattr(term, 'terminal_output'):
-                        term.terminal_output.clear()
-                except Exception as e:
-                    logger.error(f"Error disconnecting terminal: {e}")
-
-            # Disconnect mini-terminals and clear remote file browser
-            if 'file_transfer' in self.tabs:
-                ft = self.tabs['file_transfer']
-                try:
-                    if hasattr(ft, 'remote_terminal'):
-                        ft.remote_terminal.disconnect_terminal()
-                        ft.remote_terminal.display.clear()
-                    # Clear remote file browser tree so stale files
-                    # from previous server don't linger
-                    if hasattr(ft, 'remote_pane'):
-                        ft.remote_pane.file_tree.clear()
-                        ft.remote_pane.current_path = "."
-                        ft.remote_pane.path_input.setText(".")
-                except Exception as e:
-                    logger.error(f"Error cleaning up file transfer tab: {e}")
 
     def _on_profile_changed(self, *args):
         """Handle profile change."""
@@ -609,10 +546,44 @@ class MainWindow(QMainWindow):
         """Handle terminal connection loss."""
         logger.warning("Terminal connection lost")
 
+    # ── File Transfer ↔ Terminal tab sync ──
+
+    def _on_ft_pane_connected(self, side: str, is_remote: bool,
+                               ssh_manager, profile):
+        """A File Transfer pane connected — sync Terminal and Monitoring tabs."""
+        # Terminal sync
+        tt = self.tabs.get('terminal')
+        if tt:
+            tt.sync_connect(side, is_remote, ssh_manager, profile)
+        else:
+            self._pending_terminal_syncs[side] = (is_remote, ssh_manager, profile)
+
+        # Monitoring sync — only for remote clusters
+        if is_remote and ssh_manager and profile:
+            jm = self.tabs.get('job_manager')
+            if jm:
+                jm.sync_cluster_connected(side, ssh_manager, profile)
+            else:
+                self._pending_monitor_syncs[side] = (ssh_manager, profile)
+
+    def _on_ft_pane_disconnected(self, side: str):
+        """A File Transfer pane disconnected — sync Terminal and Monitoring tabs."""
+        # Terminal sync
+        self._pending_terminal_syncs.pop(side, None)
+        tt = self.tabs.get('terminal')
+        if tt:
+            tt.sync_disconnect(side)
+
+        # Monitoring sync
+        self._pending_monitor_syncs.pop(side, None)
+        jm = self.tabs.get('job_manager')
+        if jm:
+            jm.sync_cluster_disconnected(side)
+
     def _on_tab_changed(self, index: int):
         """Lazily create tab widgets on first access."""
         if index not in self._lazy_tab_indices:
-            return  # Already materialized or connection tab
+            return  # Already materialized
 
         tab_name = self._lazy_tab_indices.pop(index)
         old_widget = self.tab_widget.widget(index)
@@ -621,19 +592,12 @@ class MainWindow(QMainWindow):
             if tab_name == "Job Manager":
                 from transfpro.ui.widgets.job_manager_tab import JobManagerTab
                 widget = JobManagerTab(
-                    self.slurm_manager, self.ssh_manager,
-                    self.sftp_manager, self.gromacs_parser, self.database
+                    self.gromacs_parser, self.database
                 )
                 self.tabs['job_manager'] = widget
-            elif tab_name == "File Transfer":
-                from transfpro.ui.widgets.file_transfer_tab import FileTransferTab
-                widget = FileTransferTab(
-                    self.ssh_manager, self.sftp_manager, self.database
-                )
-                self.tabs['file_transfer'] = widget
             elif tab_name == "Terminal":
                 from transfpro.ui.widgets.terminal_tab import TerminalTab
-                widget = TerminalTab(self.ssh_manager)
+                widget = TerminalTab(self.database)
                 self.tabs['terminal'] = widget
             else:
                 return
@@ -653,8 +617,10 @@ class MainWindow(QMainWindow):
 
             logger.info(f"Lazy-loaded tab: {tab_name}")
 
-            # ── Auto-refresh the newly created tab if connected ──
-            if self.ssh_manager.is_connected():
+            # ── Auto-refresh / sync the newly created tab ──
+            # Terminal and Job Manager tabs manage their own connections
+            # (pane-level sync), so always process pending syncs.
+            if tab_name in ("Terminal", "Job Manager") or self.ssh_manager.is_connected():
                 self._initial_tab_refresh(tab_name)
 
         except Exception as e:
@@ -666,23 +632,21 @@ class MainWindow(QMainWindow):
         """Trigger initial data load for a newly-created lazy tab."""
         try:
             if tab_name == "Job Manager" and 'job_manager' in self.tabs:
-                self.tabs['job_manager'].refresh_jobs()
+                # Process any queued cluster syncs from File Transfer
+                jm = self.tabs['job_manager']
+                for side, (ssh_mgr, profile) in self._pending_monitor_syncs.items():
+                    jm.sync_cluster_connected(side, ssh_mgr, profile)
+                    logger.info(f"Job Manager: applied pending sync for {side}")
+                self._pending_monitor_syncs.clear()
                 logger.info("Job Manager: initial refresh triggered")
-            elif tab_name == "File Transfer" and 'file_transfer' in self.tabs:
-                ft = self.tabs['file_transfer']
-                if hasattr(ft, 'remote_pane'):
-                    ft.remote_pane.refresh()
-                    logger.info("File Transfer: remote pane initial refresh triggered")
-                # Auto-connect mini-terminals
-                if hasattr(ft, 'local_terminal'):
-                    ft.local_terminal.connect_terminal()
-                    logger.info("File Transfer: local mini-terminal auto-connected")
-                if hasattr(ft, 'remote_terminal'):
-                    ft.remote_terminal.connect_terminal()
-                    logger.info("File Transfer: remote mini-terminal auto-connected")
             elif tab_name == "Terminal" and 'terminal' in self.tabs:
-                self.tabs['terminal'].connect_terminal()
-                logger.info("Terminal: auto-connect triggered")
+                # Process any queued syncs from File Transfer pane connections
+                # that occurred before the Terminal tab was loaded.
+                tt = self.tabs['terminal']
+                for side, (is_remote, ssh_mgr, profile) in self._pending_terminal_syncs.items():
+                    tt.sync_connect(side, is_remote, ssh_mgr, profile)
+                    logger.info(f"Terminal: applied pending sync for {side}")
+                self._pending_terminal_syncs.clear()
         except Exception as e:
             logger.error(f"Error in initial refresh for {tab_name}: {e}")
 
@@ -693,27 +657,15 @@ class MainWindow(QMainWindow):
                 self.tabs['job_manager'].status_changed.connect(
                     self._on_job_status_changed
                 )
-        elif tab_name == "File Transfer" and 'file_transfer' in self.tabs:
-            if hasattr(self.tabs['file_transfer'], 'transfer_started'):
-                self.tabs['file_transfer'].transfer_started.connect(
-                    self._on_transfer_started
-                )
-            if hasattr(self.tabs['file_transfer'], 'transfer_completed'):
-                self.tabs['file_transfer'].transfer_completed.connect(
-                    self._on_transfer_completed
-                )
         elif tab_name == "Terminal" and 'terminal' in self.tabs:
-            if hasattr(self.tabs['terminal'], 'connection_lost'):
-                self.tabs['terminal'].connection_lost.connect(
-                    self._on_terminal_connection_lost
-                )
+            # Each TerminalPane manages its own connection lifecycle;
+            # no top-level signals to wire here.
+            pass
 
     def _on_periodic_refresh(self):
         """Handle periodic refresh timer."""
-        if not self.ssh_manager.is_connected():
-            return
         try:
-            # Refresh job manager if visible
+            # Refresh job manager if visible (it manages its own connection check)
             if self.tab_widget.currentWidget() == self.tabs.get('job_manager'):
                 if hasattr(self.tabs['job_manager'], 'refresh_jobs'):
                     self.tabs['job_manager'].refresh_jobs()
@@ -842,16 +794,6 @@ class MainWindow(QMainWindow):
                         t.quit()
                         all_threads.append(t)
 
-            ct = self.tabs.get('connection')
-            if ct:
-                if hasattr(ct, '_anim_timer'):
-                    ct._anim_timer.stop()
-                for attr in ('connection_thread', '_disconnect_thread'):
-                    t = getattr(ct, attr, None)
-                    if t and t.isRunning():
-                        t.quit()
-                        all_threads.append(t)
-
             ft = self.tabs.get('file_transfer')
             if ft:
                 for worker in list(getattr(ft, 'transfer_workers', {}).values()):
@@ -871,6 +813,13 @@ class MainWindow(QMainWindow):
                         if bt and bt.isRunning():
                             bt.quit()
                             all_threads.append(bt)
+                        # Clean up per-pane ConnectionSelector threads
+                        selector = getattr(pane, '_connection_selector', None)
+                        if selector:
+                            selector.cleanup_threads()
+
+            # Terminal tab pane cleanup (no ConnectionSelectors to clean —
+            # terminals are driven by File Transfer sync).
 
             # ── STEP 8: Wait for threads (0.5 s budget) ──
             # With the socket already dead, blocked I/O has already
@@ -898,9 +847,20 @@ class MainWindow(QMainWindow):
                 ft.transfer_workers.clear()
 
             # ── STEP 11: Full SSH cleanup on daemon thread ──
+            # Disconnect the shared (legacy) SSH manager
             threading.Thread(
                 target=self.ssh_manager.disconnect, daemon=True
             ).start()
+            # Disconnect per-pane SSH managers (file transfer)
+            if ft:
+                for pane_name in ('local_pane', 'remote_pane'):
+                    pane = getattr(ft, pane_name, None)
+                    if pane and getattr(pane, 'ssh_manager', None):
+                        threading.Thread(
+                            target=pane.ssh_manager.disconnect, daemon=True
+                        ).start()
+            # Terminal tab panes share the same SSH managers as the File
+            # Transfer panes — already disconnected above, no extra work.
 
             logger.info("Application closing")
         except Exception as e:
@@ -927,19 +887,22 @@ class MainWindow(QMainWindow):
 
     def _disconnect_all_reader_signals(self):
         """Disconnect every reader-thread signal to prevent new queuing."""
-        # Full terminal tab
+        # Dual-pane terminal tab
         tt = self.tabs.get('terminal')
         if tt:
-            reader = getattr(tt, 'reader_thread', None)
-            if reader:
-                for sig_name in ('data_received', 'error_occurred',
-                                 'channel_closed'):
-                    sig = getattr(reader, sig_name, None)
-                    if sig:
-                        try:
-                            sig.disconnect()
-                        except (TypeError, RuntimeError):
-                            pass
+            for pane in (getattr(tt, 'left_pane', None),
+                         getattr(tt, 'right_pane', None)):
+                if not pane:
+                    continue
+                reader = getattr(pane, '_reader', None)
+                if reader:
+                    for sig_name in ('data_received', 'closed'):
+                        sig = getattr(reader, sig_name, None)
+                        if sig:
+                            try:
+                                sig.disconnect()
+                            except (TypeError, RuntimeError):
+                                pass
 
         # Mini-terminals inside file_transfer tab
         ft = self.tabs.get('file_transfer')
@@ -965,14 +928,18 @@ class MainWindow(QMainWindow):
         wait/terminate.  Does NOT call channel.close() — that can
         block on network I/O.
         """
-        # Terminal tab reader
+        # Dual-pane terminal tab readers
         tt = self.tabs.get('terminal')
         if tt:
-            reader = getattr(tt, 'reader_thread', None)
-            if reader:
-                reader._running = False
-                if reader.isRunning():
-                    all_threads.append(reader)
+            for pane in (getattr(tt, 'left_pane', None),
+                         getattr(tt, 'right_pane', None)):
+                if not pane:
+                    continue
+                reader = getattr(pane, '_reader', None)
+                if reader:
+                    reader._running = False
+                    if reader.isRunning():
+                        all_threads.append(reader)
 
         # Mini-terminal readers
         ft = self.tabs.get('file_transfer')
@@ -999,21 +966,13 @@ class MainWindow(QMainWindow):
         """
         import os
         import signal
-        ft = self.tabs.get('file_transfer')
-        if not ft:
-            return
-        for term_name in ('local_terminal', 'remote_terminal'):
-            term = getattr(ft, term_name, None)
-            if not term:
-                continue
 
-            # Kill subprocess FIRST — this unblocks os.read() on the
-            # master fd by closing the slave end of the PTY.
+        def _kill_term(term):
+            if not term:
+                return
             proc = getattr(term, '_process', None)
             if proc:
                 try:
-                    # Kill the entire process group (setsid was used at
-                    # spawn time) so child processes also die.
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except (OSError, ProcessLookupError):
                     pass
@@ -1022,7 +981,6 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 term._process = None
-
             fd = getattr(term, '_master_fd', -1)
             if fd >= 0:
                 try:
@@ -1031,8 +989,21 @@ class MainWindow(QMainWindow):
                     pass
                 term._master_fd = -1
 
+        # Mini-terminals in file_transfer tab
+        ft = self.tabs.get('file_transfer')
+        if ft:
+            for term_name in ('local_terminal', 'remote_terminal'):
+                _kill_term(getattr(ft, term_name, None))
+
+        # Dual-pane terminal tab panes
+        tt = self.tabs.get('terminal')
+        if tt:
+            for pane in (getattr(tt, 'left_pane', None),
+                         getattr(tt, 'right_pane', None)):
+                _kill_term(pane)
+
     def _kill_ssh_socket(self):
-        """Shut down the raw TCP socket under the SSH transport.
+        """Shut down the raw TCP socket under all SSH transports.
 
         This force-unblocks every paramiko channel operation (recv,
         recv_ready, close) instantly without waiting for SSH protocol
@@ -1040,23 +1011,39 @@ class MainWindow(QMainWindow):
         any thread that's blocked on channel I/O.
         """
         import socket
-        try:
-            transport = (
-                self.ssh_manager._transport
-                or (self.ssh_manager._client.get_transport()
-                    if self.ssh_manager._client else None)
-            )
-            if transport and hasattr(transport, 'sock') and transport.sock:
-                try:
-                    transport.sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                try:
-                    transport.sock.close()
-                except OSError:
-                    pass
-        except Exception:
-            pass
+
+        def _kill_transport(ssh_mgr):
+            try:
+                transport = (
+                    ssh_mgr._transport
+                    or (ssh_mgr._client.get_transport()
+                        if ssh_mgr._client else None)
+                )
+                if transport and hasattr(transport, 'sock') and transport.sock:
+                    try:
+                        transport.sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    try:
+                        transport.sock.close()
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+        # Kill the shared (legacy) SSH manager
+        _kill_transport(self.ssh_manager)
+
+        # Kill per-pane SSH managers (file transfer tab)
+        ft = self.tabs.get('file_transfer')
+        if ft:
+            for pane_name in ('local_pane', 'remote_pane'):
+                pane = getattr(ft, pane_name, None)
+                if pane and getattr(pane, 'ssh_manager', None):
+                    _kill_transport(pane.ssh_manager)
+
+        # Terminal tab panes share the same SSH transport as File Transfer
+        # panes — already killed above.
 
     def _mark_all_shutdown(self):
         """Recursively mark every tab and nested widget as shutting down.
@@ -1078,10 +1065,14 @@ class MainWindow(QMainWindow):
                 if widget:
                     widget._shutdown_done = True
 
-        # Terminal tab itself
+        # Terminal tab and its panes
         tt = self.tabs.get('terminal')
         if tt:
             tt._shutdown_done = True
+            for pane in (getattr(tt, 'left_pane', None),
+                         getattr(tt, 'right_pane', None)):
+                if pane:
+                    pane._shutdown_done = True
 
     def changeEvent(self, event):
         """Handle window state changes."""
